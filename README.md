@@ -40,10 +40,14 @@ python3 main.py \
   --max-steps 300 \
   --rows 40 \
   --cols 40 \
+  --epsilon-min 0.2 \
+  --epsilon-decay 0.999 \
+  --exploration-bonus 1.0 \
   --move-delay 2.0 \
   --enter-delay 600 \
   --location-retries 3 \
   --location-retry-delay 1.0 \
+  --null-state-terminal-reward 1000 \
   --history-limit 200
 ```
 
@@ -51,8 +55,11 @@ Key flags:
 
 - `--rows`, `--cols`: grid dimensions used for state indexing and Q-table shape.
 - `--history-limit`: caps stored episode summaries in metadata.
+- `--epsilon-min`, `--epsilon-decay`: keep more exploration active for longer during training.
+- `--exploration-bonus`: adds a count-based bonus to less-visited actions during greedy selection, which improves map coverage.
 - `--enter-delay`: defaults to `600` seconds to respect the assignment rule of no more than one `enter` call every 10 minutes.
 - `--location-retries`, `--location-retry-delay`: retry `location` after incomplete move responses before falling back to a self-loop.
+- `--null-state-terminal-reward`: if `nextState` is `null` and `abs(reward)` reaches this threshold, the move is treated as an assumed terminal outcome.
 - `--strict-missing-state`: fail the episode if a move response and fallback location lookup both omit the next state. By default the agent assumes a self-loop and records a warning.
 - `--quiet`: suppresses per-step logging.
 
@@ -70,6 +77,7 @@ The metadata file stores:
 - best reward
 - rolling reward and rate metrics
 - cumulative action/state counters
+- assumed terminal event counts for `null`-state high-magnitude rewards
 - recent warnings, including inferred self-loops caused by incomplete API responses
 
 ## Tests

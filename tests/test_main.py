@@ -29,6 +29,7 @@ class ParserTests(unittest.TestCase):
                 done=False,
                 blocked=True,
                 invalid_move=False,
+                assumed_terminal=False,
                 raw={"reward": -1, "message": "Blocked by wall"},
             ),
         )
@@ -40,6 +41,33 @@ class ParserTests(unittest.TestCase):
         )
         self.assertTrue(outcome.done)
         self.assertEqual(outcome.next_state, -1)
+        self.assertFalse(outcome.assumed_terminal)
+
+    def test_large_negative_reward_only_assumes_terminal_when_next_state_is_null(self) -> None:
+        terminal_outcome = self.parser.parse_move_result(
+            {"reward": -1000, "newState": None, "worldId": 0},
+            current_state=4,
+        )
+        non_terminal_outcome = self.parser.parse_move_result(
+            {"reward": -1000, "newState": 3, "worldId": 0},
+            current_state=4,
+        )
+        self.assertTrue(terminal_outcome.done)
+        self.assertTrue(terminal_outcome.assumed_terminal)
+        self.assertFalse(non_terminal_outcome.assumed_terminal)
+
+    def test_large_positive_reward_only_assumes_terminal_when_next_state_is_null(self) -> None:
+        terminal_outcome = self.parser.parse_move_result(
+            {"reward": 1000, "newState": None, "worldId": 0},
+            current_state=4,
+        )
+        non_terminal_outcome = self.parser.parse_move_result(
+            {"reward": 1000, "newState": 3, "worldId": 0},
+            current_state=4,
+        )
+        self.assertTrue(terminal_outcome.done)
+        self.assertTrue(terminal_outcome.assumed_terminal)
+        self.assertFalse(non_terminal_outcome.assumed_terminal)
 
 
 class LearnerTests(unittest.TestCase):
@@ -50,6 +78,15 @@ class LearnerTests(unittest.TestCase):
 
         chosen = {learner.choose_action(q_table, 0, epsilon=0.0) for _ in range(50)}
         self.assertEqual(chosen, {1, 2})
+
+    def test_exploration_bonus_prefers_less_visited_action(self) -> None:
+        learner = QLearner(alpha=0.1, gamma=0.9, num_states=1, num_actions=4, exploration_bonus=2.0)
+        q_table = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+        visits = np.array([[20.0, 0.0, 20.0, 20.0]], dtype=np.float32)
+        random.seed(0)
+
+        chosen = learner.choose_action(q_table, 0, epsilon=0.0, action_visits=visits)
+        self.assertEqual(chosen, 1)
 
 
 class AgentTests(unittest.TestCase):
@@ -85,6 +122,7 @@ class AgentTests(unittest.TestCase):
                 done=False,
                 blocked=False,
                 invalid_move=False,
+                assumed_terminal=False,
                 raw={"reward": -1},
             )
 

@@ -53,8 +53,8 @@ class QConfig:
     alpha: float = 0.1
     gamma: float = 0.95
     epsilon: float = 1.0
-    epsilon_min: float = 0.05
-    epsilon_decay: float = 0.995
+    epsilon_min: float = 0.2
+    epsilon_decay: float = 0.999
     max_episodes: int = 5
     max_steps_per_episode: int = 300
     move_delay_sec: float = 15.5
@@ -69,6 +69,8 @@ class QConfig:
     infer_self_loop_on_missing_state: bool = True
     location_retry_attempts: int = 3
     location_retry_delay_sec: float = 1.0
+    null_state_terminal_reward_abs: float = 1000.0
+    exploration_bonus: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class MoveOutcome:
     done: bool
     blocked: bool
     invalid_move: bool
+    assumed_terminal: bool
     raw: Dict
 
 
@@ -202,8 +205,9 @@ class GridWorldClient:
 
 
 class GridWorldResponseParser:
-    def __init__(self, grid: GridSpec):
+    def __init__(self, grid: GridSpec, null_state_terminal_reward_abs: float = 1000.0):
         self.grid = grid
+        self.null_state_terminal_reward_abs = abs(null_state_terminal_reward_abs)
 
     @staticmethod
     def _extract_first_int(obj: Dict, keys: Sequence[str]) -> Optional[int]:
@@ -317,7 +321,12 @@ class GridWorldResponseParser:
         if any(token in message for token in ("exit", "terminal", "finished", "goal", "win")):
             done = True
 
-        if not done and next_state is None and (blocked or invalid_move):
+        assumed_terminal = False
+
+        if next_state is None and abs(reward) >= self.null_state_terminal_reward_abs:
+            done = True
+            assumed_terminal = True
+        elif not done and next_state is None and (blocked or invalid_move):
             next_state = current_state
 
         return MoveOutcome(
@@ -326,6 +335,7 @@ class GridWorldResponseParser:
             done=done,
             blocked=blocked,
             invalid_move=invalid_move,
+            assumed_terminal=assumed_terminal,
             raw=data,
         )
 
@@ -397,16 +407,32 @@ class QTableStore:
 
 
 class QLearner:
-    def __init__(self, alpha: float, gamma: float, num_states: int, num_actions: int):
+    def __init__(
+        self,
+        alpha: float,
+        gamma: float,
+        num_states: int,
+        num_actions: int,
+        exploration_bonus: float = 0.0,
+    ):
         self.alpha = alpha
         self.gamma = gamma
         self.num_states = num_states
         self.num_actions = num_actions
+        self.exploration_bonus = exploration_bonus
 
-    def choose_action(self, q_table: np.ndarray, state: int, epsilon: float) -> int:
+    def choose_action(
+        self,
+        q_table: np.ndarray,
+        state: int,
+        epsilon: float,
+        action_visits: Optional[np.ndarray] = None,
+    ) -> int:
         if random.random() < epsilon:
             return random.randrange(self.num_actions)
-        row = q_table[state]
+        row = q_table[state].astype(np.float64, copy=True)
+        if action_visits is not None and self.exploration_bonus > 0:
+            row += self.exploration_bonus / np.sqrt(action_visits[state] + 1.0)
         best_value = np.max(row)
         best_indices = np.flatnonzero(np.isclose(row, best_value))
         return int(random.choice(best_indices.tolist()))
@@ -445,9 +471,19 @@ class QLearningAgent:
         self.grid = GridSpec(rows=saved_rows, cols=saved_cols)
         self.meta["grid"] = {"rows": self.grid.rows, "cols": self.grid.cols}
         self.q = self.store.load_q_table((self.grid.num_states, self.num_actions))
+        self.action_visits = np.zeros((self.grid.num_states, self.num_actions), dtype=np.float32)
         self.client = GridWorldClient(config.team_id, config.api_key, config.user_id)
-        self.parser = GridWorldResponseParser(self.grid)
-        self.learner = QLearner(config.alpha, config.gamma, self.grid.num_states, self.num_actions)
+        self.parser = GridWorldResponseParser(
+            self.grid,
+            null_state_terminal_reward_abs=config.null_state_terminal_reward_abs,
+        )
+        self.learner = QLearner(
+            config.alpha,
+            config.gamma,
+            self.grid.num_states,
+            self.num_actions,
+            exploration_bonus=config.exploration_bonus,
+        )
 
     def save(self) -> None:
         self.store.save(self.q, self.meta)
@@ -517,6 +553,8 @@ class QLearningAgent:
             )
         metrics["last_episode_reward"] = float(episode_summary["total_reward"])
         metrics["best_episode_reward"] = self.meta.get("best_episode_reward")
+        metrics["exploration_bonus"] = float(self.cfg.exploration_bonus)
+        metrics["epsilon_min"] = float(self.cfg.epsilon_min)
 
     def enter_world_once(self) -> int:
         self._respect_rate_limit("last_enter_ts", self.cfg.enter_delay_sec)
@@ -567,6 +605,7 @@ class QLearningAgent:
         done = False
         blocked_moves = 0
         invalid_moves = 0
+        assumed_terminal_events = 0
         visited_states = [state]
         action_counts = {action: 0 for action in self.actions}
         step = 0
@@ -576,10 +615,11 @@ class QLearningAgent:
                 raise GridWorldAPIError(f"Invalid state index: {state}")
 
             self._bump_total(f"state_{state}_visits")
-            action_idx = self.learner.choose_action(self.q, state, epsilon)
+            action_idx = self.learner.choose_action(self.q, state, epsilon, self.action_visits)
             action = self.actions[action_idx]
             action_counts[action] += 1
             self._bump_total(f"action_{action}_count")
+            self.action_visits[state, action_idx] += 1.0
 
             self._respect_rate_limit("last_move_ts", self.cfg.move_delay_sec)
             move_data = self.client.move(self.cfg.world_id, action)
@@ -591,6 +631,7 @@ class QLearningAgent:
             done = outcome.done
             blocked_moves += int(outcome.blocked)
             invalid_moves += int(outcome.invalid_move)
+            assumed_terminal_events += int(outcome.assumed_terminal)
 
             if next_state is None and not done:
                 next_state = self._safe_get_location()
@@ -620,11 +661,14 @@ class QLearningAgent:
                     f"Episode {episode_index} | Step {step:03d} | State {state:4d} | "
                     f"Action {action:>5s} | Reward {reward:8.3f} | "
                     f"Next {str(next_state):>4s} | Done={done} | "
-                    f"Blocked={outcome.blocked} | Invalid={outcome.invalid_move}"
+                    f"Blocked={outcome.blocked} | Invalid={outcome.invalid_move} | "
+                    f"AssumedTerminal={outcome.assumed_terminal}"
                 )
 
             if done:
                 self._bump_total("terminal_episodes")
+                if outcome.assumed_terminal:
+                    self._bump_total("assumed_terminal_events")
                 break
 
             state = next_state
@@ -646,6 +690,7 @@ class QLearningAgent:
             "unique_states": len(set(visited_states)),
             "blocked_moves": blocked_moves,
             "invalid_moves": invalid_moves,
+            "assumed_terminal_events": assumed_terminal_events,
             "mean_abs_td_error": float(total_td_error / max(1, step)),
             "action_counts": action_counts,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -698,11 +743,11 @@ def parse_args() -> QConfig:
     parser.add_argument("--world-id", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--gamma", type=float, default=0.95)
-    parser.add_argument("--epsilon", type=float, default=1.0)
-    parser.add_argument("--epsilon-min", type=float, default=0.05)
-    parser.add_argument("--epsilon-decay", type=float, default=0.995)
+    parser.add_argument("--epsilon", type=float, default=0.9)
+    parser.add_argument("--epsilon-min", type=float, default=0.2)
+    parser.add_argument("--epsilon-decay", type=float, default=0.999)
     parser.add_argument("--episodes", type=int, default=5)
-    parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--move-delay", type=float, default=2.0)
     parser.add_argument("--enter-delay", type=float, default=600.0)
     parser.add_argument("--storage-dir", type=str, default="q_data")
@@ -711,6 +756,8 @@ def parse_args() -> QConfig:
     parser.add_argument("--history-limit", type=int, default=200)
     parser.add_argument("--location-retries", type=int, default=3)
     parser.add_argument("--location-retry-delay", type=float, default=1.0)
+    parser.add_argument("--null-state-terminal-reward", type=float, default=1000.0)
+    parser.add_argument("--exploration-bonus", type=float, default=1.0)
     parser.add_argument(
         "--strict-missing-state",
         action="store_true",
@@ -751,6 +798,8 @@ def parse_args() -> QConfig:
         infer_self_loop_on_missing_state=not args.strict_missing_state,
         location_retry_attempts=args.location_retries,
         location_retry_delay_sec=args.location_retry_delay,
+        null_state_terminal_reward_abs=args.null_state_terminal_reward,
+        exploration_bonus=args.exploration_bonus,
     )
 
 
