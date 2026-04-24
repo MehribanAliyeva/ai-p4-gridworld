@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from main import CampaignStore, GridSpec, GridWorldResponseParser, MoveOutcome, QConfig, QLearner, QLearningAgent
+from main import CampaignRunner, CampaignStore, GridSpec, GridWorldResponseParser, MoveOutcome, QConfig, QLearner, QLearningAgent
 
 
 class ParserTests(unittest.TestCase):
@@ -204,14 +204,67 @@ class AgentTests(unittest.TestCase):
 
             self.assertGreater(first, later)
 
+    def test_run_episode_labels_terminal_as_hazard_or_goal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = QConfig(
+                team_id=1,
+                api_key="k",
+                user_id="u",
+                storage_dir=tmp_dir,
+                max_steps_per_episode=1,
+                epsilon=0.0,
+                epsilon_min=0.0,
+                exploration_bonus=0.0,
+                state_novelty_bonus=0.0,
+                verbose=False,
+                move_delay_sec=0.0,
+            )
+            agent = QLearningAgent(cfg)
+            agent.client.move = lambda world_id, move: {"reward": -1000, "newState": None, "worldId": world_id}
+
+            summary = agent.run_episode(1, 0)
+
+            self.assertTrue(summary["ended"])
+            self.assertEqual(summary["terminal_kind"], "hazard")
+            self.assertEqual(summary["terminal_reward"], -1000.0)
+            self.assertIsNone(summary["final_state"])
+
     def test_campaign_store_initializes_world_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg = QConfig(team_id=1, api_key="k", user_id="u", storage_dir=tmp_dir)
             store = CampaignStore(tmp_dir)
             progress = store.load(cfg)
 
-            self.assertEqual(progress["worlds"]["1"]["traversals_completed"], 0)
-            self.assertEqual(progress["worlds"]["10"]["traversals_completed"], 0)
+            self.assertFalse(progress["worlds"]["1"]["goal_found"])
+            self.assertEqual(progress["worlds"]["1"]["optimization_runs_completed"], 0)
+            self.assertEqual(progress["worlds"]["10"]["hazards_found"], 0)
+
+    def test_campaign_runner_waits_for_goal_before_world_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = QConfig(team_id=1, api_key="k", user_id="u", storage_dir=tmp_dir, traversals_per_world=5)
+            runner = CampaignRunner(cfg)
+            world = runner._world_progress(1)
+
+            world["optimization_runs_completed"] = 5
+            self.assertFalse(runner._world_is_complete(1))
+
+            world["goal_found"] = True
+            self.assertTrue(runner._world_is_complete(1))
+
+    def test_campaign_store_migrates_old_traversal_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            progress_path = Path(tmp_dir) / "campaign_progress.json"
+            progress_path.write_text(
+                '{"worlds": {"1": {"traversals_completed": 3}}}',
+                encoding="utf-8",
+            )
+
+            cfg = QConfig(team_id=1, api_key="k", user_id="u", storage_dir=tmp_dir)
+            store = CampaignStore(tmp_dir)
+            progress = store.load(cfg)
+
+            self.assertEqual(progress["worlds"]["1"]["optimization_runs_completed"], 3)
+            self.assertNotIn("traversals_completed", progress["worlds"]["1"])
 
 
 if __name__ == "__main__":

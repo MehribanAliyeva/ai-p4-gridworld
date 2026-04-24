@@ -471,7 +471,20 @@ class CampaignStore:
 
         worlds = progress.setdefault("worlds", {})
         for world_id in range(cfg.campaign_world_start, cfg.campaign_world_end + 1):
-            worlds.setdefault(str(world_id), {"traversals_completed": 0})
+            world_progress = worlds.setdefault(str(world_id), {})
+            legacy_traversals_completed = world_progress.get("traversals_completed")
+            world_progress.setdefault("goal_found", False)
+            world_progress.setdefault("goal_reward", None)
+            world_progress.setdefault("hazards_found", 0)
+            world_progress.setdefault("optimization_runs_completed", 0)
+            world_progress.setdefault("terminals_found", 0)
+            world_progress.setdefault("last_terminal_kind", None)
+            world_progress.setdefault("last_terminal_reward", None)
+            world_progress.setdefault("last_known_state", None)
+            # Backward compatibility with older progress files.
+            if legacy_traversals_completed is not None and int(world_progress["optimization_runs_completed"]) == 0:
+                world_progress["optimization_runs_completed"] = int(legacy_traversals_completed)
+            world_progress.pop("traversals_completed", None)
         progress.setdefault("active_world", None)
         progress.setdefault("last_enter_ts", 0.0)
         progress.setdefault("last_summary", None)
@@ -702,6 +715,8 @@ class QLearningAgent:
         visited_states = [state]
         action_counts = {action: 0 for action in self.actions}
         step = 0
+        terminal_reward = None
+        terminal_kind = None
 
         for step in range(1, self.cfg.max_steps_per_episode + 1):
             if not self.grid.contains_state(state):
@@ -768,6 +783,8 @@ class QLearningAgent:
                 )
 
             if done:
+                terminal_reward = float(reward)
+                terminal_kind = "hazard" if reward < 0 else "goal"
                 self._bump_total("terminal_episodes")
                 if outcome.assumed_terminal:
                     self._bump_total("assumed_terminal_events")
@@ -796,6 +813,9 @@ class QLearningAgent:
             "invalid_moves": invalid_moves,
             "assumed_terminal_events": assumed_terminal_events,
             "mean_abs_td_error": float(total_td_error / max(1, step)),
+            "terminal_reward": terminal_reward,
+            "terminal_kind": terminal_kind,
+            "final_state": None if done else int(state),
             "action_counts": action_counts,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -854,9 +874,15 @@ class CampaignRunner:
     def _world_progress(self, world_id: int) -> Dict:
         return self.progress["worlds"][str(world_id)]
 
+    def _world_is_complete(self, world_id: int) -> bool:
+        world_progress = self._world_progress(world_id)
+        return bool(world_progress["goal_found"]) and (
+            int(world_progress["optimization_runs_completed"]) >= self.cfg.traversals_per_world
+        )
+
     def _next_incomplete_world(self) -> Optional[int]:
         for world_id in range(self.cfg.campaign_world_start, self.cfg.campaign_world_end + 1):
-            if self._world_progress(world_id)["traversals_completed"] < self.cfg.traversals_per_world:
+            if not self._world_is_complete(world_id):
                 return world_id
         return None
 
@@ -900,7 +926,7 @@ class CampaignRunner:
 
         if self.cfg.campaign_world_start <= location.world_id <= self.cfg.campaign_world_end:
             active_world = int(location.world_id)
-            if self._world_progress(active_world)["traversals_completed"] < self.cfg.traversals_per_world:
+            if not self._world_is_complete(active_world):
                 agent = self._build_agent(active_world)
                 if not agent.grid.contains_state(location.state):
                     raise GridWorldAPIError(
@@ -920,30 +946,57 @@ class CampaignRunner:
         while True:
             target_world = self._next_incomplete_world()
             if target_world is None:
-                print("Campaign complete: worlds 1-10 have all been traversed 5 times.")
+                print(
+                    "Campaign complete: worlds 1-10 have all discovered a goal terminal and finished 5 optimization runs."
+                )
                 break
 
             try:
                 agent, start_state = self._start_or_resume_world(target_world)
-                traversals_completed = self._world_progress(agent.cfg.world_id)["traversals_completed"]
-                summary = agent.run_episode(traversals_completed + 1, start_state)
+                world_progress = self._world_progress(agent.cfg.world_id)
+                episode_index = int(world_progress["terminals_found"]) + 1
+                summary = agent.run_episode(episode_index, start_state)
                 agent.save()
 
                 self.progress["active_world"] = agent.cfg.world_id
+                world_progress["last_known_state"] = summary.get("final_state")
                 self.progress["last_summary"] = {
                     "world_id": agent.cfg.world_id,
-                    "traversal_attempt": traversals_completed + 1,
+                    "terminal_attempt": episode_index,
                     **summary,
                 }
 
                 if summary["ended"]:
-                    self._world_progress(agent.cfg.world_id)["traversals_completed"] += 1
-                    completed = self._world_progress(agent.cfg.world_id)["traversals_completed"]
+                    world_progress["terminals_found"] = int(world_progress["terminals_found"]) + 1
+                    world_progress["last_terminal_kind"] = summary.get("terminal_kind")
+                    world_progress["last_terminal_reward"] = summary.get("terminal_reward")
+                    world_progress["last_known_state"] = None
+
+                    if summary.get("terminal_kind") == "hazard":
+                        world_progress["hazards_found"] = int(world_progress["hazards_found"]) + 1
+                        print(
+                            f"World {agent.cfg.world_id} hit a hazard terminal "
+                            f"(reward={summary.get('terminal_reward')}). Continuing discovery."
+                        )
+                    elif summary.get("terminal_kind") == "goal":
+                        if not world_progress["goal_found"]:
+                            world_progress["goal_found"] = True
+                            world_progress["goal_reward"] = summary.get("terminal_reward")
+                            print(
+                                f"World {agent.cfg.world_id} discovered a goal terminal "
+                                f"(reward={summary.get('terminal_reward')}). Starting optimization runs."
+                            )
+                        else:
+                            world_progress["optimization_runs_completed"] = (
+                                int(world_progress["optimization_runs_completed"]) + 1
+                            )
+                            completed = int(world_progress["optimization_runs_completed"])
+                            print(
+                                f"World {agent.cfg.world_id} optimization run complete: "
+                                f"{completed}/{self.cfg.traversals_per_world}."
+                            )
+
                     self.progress["active_world"] = None
-                    print(
-                        f"World {agent.cfg.world_id} traversal complete: "
-                        f"{completed}/{self.cfg.traversals_per_world}."
-                    )
                 else:
                     print(
                         f"World {agent.cfg.world_id} run still in progress after {summary['steps']} step(s); "
