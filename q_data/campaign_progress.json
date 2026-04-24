@@ -1,0 +1,61 @@
+{
+  "worlds": {
+    "1": {
+      "traversals_completed": 0
+    },
+    "2": {
+      "traversals_completed": 0
+    },
+    "3": {
+      "traversals_completed": 0
+    },
+    "4": {
+      "traversals_completed": 0
+    },
+    "5": {
+      "traversals_completed": 0
+    },
+    "6": {
+      "traversals_completed": 0
+    },
+    "7": {
+      "traversals_completed": 0
+    },
+    "8": {
+      "traversals_completed": 0
+    },
+    "9": {
+      "traversals_completed": 0
+    },
+    "10": {
+      "traversals_completed": 0
+    }
+  },
+  "active_world": 1,
+  "last_enter_ts": 1776966863.286321,
+  "last_summary": {
+    "world_id": 1,
+    "traversal_attempt": 1,
+    "episode": 1,
+    "total_reward": 7.32,
+    "total_policy_reward": 16.285415947139278,
+    "steps": 50,
+    "ended": false,
+    "epsilon_after": 0.893718868531481,
+    "unique_states": 24,
+    "blocked_moves": 0,
+    "invalid_moves": 0,
+    "assumed_terminal_events": 0,
+    "mean_abs_td_error": 0.34181710808873184,
+    "action_counts": {
+      "N": 11,
+      "S": 14,
+      "E": 7,
+      "W": 18
+    },
+    "timestamp": "2026-04-23 22:44:14"
+  },
+  "campaign_world_start": 1,
+  "campaign_world_end": 10,
+  "traversals_per_world": 5
+}

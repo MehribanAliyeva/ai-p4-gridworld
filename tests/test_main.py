@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from main import GridSpec, GridWorldResponseParser, MoveOutcome, QConfig, QLearner, QLearningAgent
+from main import CampaignStore, GridSpec, GridWorldResponseParser, MoveOutcome, QConfig, QLearner, QLearningAgent
 
 
 class ParserTests(unittest.TestCase):
@@ -16,7 +16,12 @@ class ParserTests(unittest.TestCase):
         state = self.parser.parse_location_state({"data": {"location": "2:3"}})
         self.assertEqual(state, 13)
 
-    def test_parse_move_result_marks_blocked_move_as_self_loop(self) -> None:
+    def test_parse_location_info_reads_world_and_state(self) -> None:
+        info = self.parser.parse_location_info({"world": 3, "state": "2:3"})
+        self.assertEqual(info.world_id, 3)
+        self.assertEqual(info.state, 13)
+
+    def test_parse_move_result_does_not_infer_self_loop_from_message_text(self) -> None:
         outcome = self.parser.parse_move_result(
             {"reward": -1, "message": "Blocked by wall"},
             current_state=7,
@@ -25,9 +30,9 @@ class ParserTests(unittest.TestCase):
             outcome,
             MoveOutcome(
                 reward=-1.0,
-                next_state=7,
+                next_state=None,
                 done=False,
-                blocked=True,
+                blocked=False,
                 invalid_move=False,
                 assumed_terminal=False,
                 raw={"reward": -1, "message": "Blocked by wall"},
@@ -55,6 +60,15 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(terminal_outcome.done)
         self.assertTrue(terminal_outcome.assumed_terminal)
         self.assertFalse(non_terminal_outcome.assumed_terminal)
+
+    def test_parse_move_result_does_not_infer_blocked_or_invalid_from_missing_message(self) -> None:
+        outcome = self.parser.parse_move_result(
+            {"reward": -1, "newState": None, "worldId": 0},
+            current_state=4,
+        )
+        self.assertFalse(outcome.blocked)
+        self.assertFalse(outcome.invalid_move)
+        self.assertFalse(outcome.done)
 
     def test_large_positive_reward_only_assumes_terminal_when_next_state_is_null(self) -> None:
         terminal_outcome = self.parser.parse_move_result(
@@ -86,6 +100,14 @@ class LearnerTests(unittest.TestCase):
         random.seed(0)
 
         chosen = learner.choose_action(q_table, 0, epsilon=0.0, action_visits=visits)
+        self.assertEqual(chosen, 1)
+
+    def test_eval_mode_equivalent_policy_is_greedy_when_epsilon_zero(self) -> None:
+        learner = QLearner(alpha=0.1, gamma=0.9, num_states=1, num_actions=4, exploration_bonus=0.0)
+        q_table = np.array([[1.0, 5.0, 2.0, 1.0]], dtype=np.float32)
+        random.seed(0)
+
+        chosen = learner.choose_action(q_table, 0, epsilon=0.0)
         self.assertEqual(chosen, 1)
 
 
@@ -156,6 +178,40 @@ class AgentTests(unittest.TestCase):
     def test_enter_delay_default_matches_assignment_limit(self) -> None:
         cfg = QConfig(team_id=1, api_key="k", user_id="u")
         self.assertEqual(cfg.enter_delay_sec, 600.0)
+
+    def test_state_novelty_reward_is_zero_in_eval_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = QConfig(team_id=1, api_key="k", user_id="u", storage_dir=tmp_dir, eval_mode=True)
+            agent = QLearningAgent(cfg)
+            agent.state_visits[7] = 0
+
+            self.assertEqual(agent._state_novelty_reward(7, done=False), 0.0)
+
+    def test_state_novelty_reward_decreases_with_visits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = QConfig(
+                team_id=1,
+                api_key="k",
+                user_id="u",
+                storage_dir=tmp_dir,
+                state_novelty_bonus=1.0,
+            )
+            agent = QLearningAgent(cfg)
+            agent.state_visits[7] = 0
+            first = agent._state_novelty_reward(7, done=False)
+            agent.state_visits[7] = 8
+            later = agent._state_novelty_reward(7, done=False)
+
+            self.assertGreater(first, later)
+
+    def test_campaign_store_initializes_world_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = QConfig(team_id=1, api_key="k", user_id="u", storage_dir=tmp_dir)
+            store = CampaignStore(tmp_dir)
+            progress = store.load(cfg)
+
+            self.assertEqual(progress["worlds"]["1"]["traversals_completed"], 0)
+            self.assertEqual(progress["worlds"]["10"]["traversals_completed"], 0)
 
 
 if __name__ == "__main__":
