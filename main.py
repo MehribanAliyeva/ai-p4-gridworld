@@ -79,9 +79,12 @@ class QConfig:
     eval_mode: bool = False
     goal_optimization_mode: bool = False
     frontier_search_prob: float = 0.85
-    loop_penalty_weight: float = 0.5
+    loop_penalty_weight: float = 0.1
     hazard_penalty_multiplier: float = 3.0
-    goal_short_path_bonus: float = 100.0
+    goal_short_path_bonus: float = 300.0
+    goal_q_bias_multiplier: float = 2.0
+    goal_reward_gradient_weight: float = 1.0
+    goal_backtrack_penalty: float = 0.3
     campaign_world_start: int = 1
     campaign_world_end: int = 10
     traversals_per_world: int = 5
@@ -467,6 +470,7 @@ class QTableStore:
         meta.setdefault("tried_transitions", [])
         meta.setdefault("discovered_states", [])
         meta.setdefault("known_terminal_events", [])
+        meta.setdefault("state_reward_avg", {})
         return meta
 
     def save(
@@ -818,6 +822,57 @@ class QLearningAgent:
         if len(events) > self.cfg.history_limit:
             del events[:-self.cfg.history_limit]
 
+    def _update_state_reward_avg(self, next_state: Optional[int], reward: float) -> None:
+        """Track average immediate reward for each state as a local gradient signal."""
+        if next_state is None or not self.grid.contains_state(next_state):
+            return
+        state_reward_avg = self.meta.setdefault("state_reward_avg", {})
+        key = str(int(next_state))
+        old_avg = float(state_reward_avg.get(key, reward))
+        state_reward_avg[key] = float(0.9 * old_avg + 0.1 * reward)
+
+    def _choose_goal_biased_action(self, state: int, epsilon: float, prev_state: Optional[int]) -> int:
+        """Goal optimization policy: Q boost + reward-gradient + anti-backtracking."""
+        bad = set(self.meta.get("bad_transitions", []))
+
+        if random.random() < epsilon:
+            candidates = []
+            for idx, act in enumerate(self.actions):
+                neighbor = self.learner._neighbor_state(state, idx)
+                if neighbor is None:
+                    continue
+                if self._transition_key(state, act) in bad:
+                    continue
+                candidates.append(idx)
+            if candidates:
+                return int(random.choice(candidates))
+            return random.randrange(self.num_actions)
+
+        row = self.q[state].astype(np.float64, copy=True)
+        row *= float(self.cfg.goal_q_bias_multiplier)
+
+        state_reward_avg = self.meta.get("state_reward_avg", {})
+        for idx, act in enumerate(self.actions):
+            neighbor = self.learner._neighbor_state(state, idx)
+            key = self._transition_key(state, act)
+
+            if neighbor is None:
+                row[idx] -= 10000.0
+                continue
+            if key in bad:
+                row[idx] -= 10000.0
+                continue
+
+            avg_reward = float(state_reward_avg.get(str(int(neighbor)), 0.0))
+            row[idx] += float(self.cfg.goal_reward_gradient_weight) * avg_reward
+
+            if prev_state is not None and neighbor == prev_state:
+                row[idx] -= float(self.cfg.goal_backtrack_penalty)
+
+        best_value = np.max(row)
+        best_indices = np.flatnonzero(np.isclose(row, best_value))
+        return int(random.choice(best_indices.tolist()))
+
     def _avoid_bad_action(self, state: int, action_idx: int) -> int:
         bad = set(self.meta.get("bad_transitions", []))
         if not bad:
@@ -881,8 +936,11 @@ class QLearningAgent:
                     queue.append((nxt, a_idx if first_action is None else first_action))
         return None
 
-    def _choose_exploration_action(self, state: int, epsilon: float) -> int:
-        if (not self.cfg.eval_mode and not self.cfg.goal_optimization_mode and random.random() < self.cfg.frontier_search_prob):
+    def _choose_exploration_action(self, state: int, epsilon: float, prev_state: Optional[int] = None) -> int:
+        if self.cfg.goal_optimization_mode:
+            return self._choose_goal_biased_action(state, epsilon, prev_state)
+
+        if (not self.cfg.eval_mode and random.random() < self.cfg.frontier_search_prob):
             frontier_idx = self._frontier_action(state)
             if frontier_idx is not None:
                 return self._avoid_bad_action(state, frontier_idx)
@@ -918,7 +976,8 @@ class QLearningAgent:
             if not self.cfg.eval_mode:
                 self.state_visits[state] += 1.0
             self._bump_total(f"state_{state}_visits")
-            action_idx = self._choose_exploration_action(state, epsilon)
+            prev_state = visited_states[-2] if len(visited_states) > 1 else None
+            action_idx = self._choose_exploration_action(state, epsilon, prev_state)
             action = self.actions[action_idx]
             action_counts[action] += 1
             self._bump_total(f"action_{action}_count")
@@ -953,11 +1012,18 @@ class QLearningAgent:
                     self._record_warning(warning)
                     print(f"Warning: {warning}")
 
+            self._update_state_reward_avg(next_state, reward)
             novelty_reward = self._state_novelty_reward(next_state, done)
             loop_penalty = 0.0
             if next_state is not None and self.grid.contains_state(next_state):
-                revisits = max(0, episode_state_counts.get(next_state, 0) - 1)
-                loop_penalty = -float(self.cfg.loop_penalty_weight) * revisits
+                # Optimization shaping:
+                # - self-loop wastes a move, so punish it strongly.
+                # - normal revisits can be necessary, so punish them lightly.
+                if next_state == state:
+                    loop_penalty = -1.0
+                else:
+                    revisits = max(0, episode_state_counts.get(next_state, 0) - 1)
+                    loop_penalty = -float(self.cfg.loop_penalty_weight) * revisits
 
             if done and reward < 0:
                 self._remember_bad_transition(state, action, reward)
@@ -1198,7 +1264,7 @@ class CampaignRunner:
 
                     # Almost greedy: mostly follows the best known path,
                     # but keeps tiny exploration to discover shorter alternatives.
-                    agent.meta["epsilon"] = 0.05
+                    agent.meta["epsilon"] = 0.01
 
                     # Turn off exploration/novelty bonuses during optimization.
                     # Important: update both cfg and learner, because QLearner stores
@@ -1207,14 +1273,17 @@ class CampaignRunner:
                     agent.cfg.state_novelty_bonus = 0.0
                     agent.cfg.unvisited_state_bonus = 0.0
                     agent.cfg.frontier_bonus = 0.0
-                    agent.cfg.frontier_search_prob = 0.05
+                    agent.cfg.frontier_search_prob = 0.0
                     agent.learner.exploration_bonus = 0.0
                     agent.learner.unvisited_state_bonus = 0.0
                     agent.learner.frontier_bonus = 0.0
 
                     # More aggressive optimization after the goal is known.
-                    agent.learner.alpha = 0.3
+                    agent.learner.alpha = 0.4
                     agent.learner.gamma = 0.98
+                    agent.cfg.goal_q_bias_multiplier = max(agent.cfg.goal_q_bias_multiplier, 2.0)
+                    agent.cfg.goal_reward_gradient_weight = max(agent.cfg.goal_reward_gradient_weight, 1.0)
+                    agent.cfg.goal_backtrack_penalty = max(agent.cfg.goal_backtrack_penalty, 0.3)
 
                 episode_index = int(world_progress["terminals_found"]) + 1
                 summary = agent.run_episode(episode_index, start_state)
@@ -1307,9 +1376,12 @@ def parse_args() -> QConfig:
     parser.add_argument("--unvisited-state-bonus", type=float, default=1.0)
     parser.add_argument("--frontier-bonus", type=float, default=0.2)
     parser.add_argument("--frontier-search-prob", type=float, default=0.85)
-    parser.add_argument("--loop-penalty-weight", type=float, default=0.5)
+    parser.add_argument("--loop-penalty-weight", type=float, default=0.1)
     parser.add_argument("--hazard-penalty-multiplier", type=float, default=3.0)
-    parser.add_argument("--goal-short-path-bonus", type=float, default=100.0)
+    parser.add_argument("--goal-short-path-bonus", type=float, default=300.0)
+    parser.add_argument("--goal-q-bias-multiplier", type=float, default=2.0)
+    parser.add_argument("--goal-reward-gradient-weight", type=float, default=1.0)
+    parser.add_argument("--goal-backtrack-penalty", type=float, default=0.3)
     parser.add_argument(
         "--start-world",
         type=int,
@@ -1377,6 +1449,9 @@ def parse_args() -> QConfig:
         loop_penalty_weight=args.loop_penalty_weight,
         hazard_penalty_multiplier=args.hazard_penalty_multiplier,
         goal_short_path_bonus=args.goal_short_path_bonus,
+        goal_q_bias_multiplier=args.goal_q_bias_multiplier,
+        goal_reward_gradient_weight=args.goal_reward_gradient_weight,
+        goal_backtrack_penalty=args.goal_backtrack_penalty,
         eval_mode=args.eval_mode,
         campaign_world_start=campaign_world_start,
         campaign_world_end=args.campaign_world_end,
