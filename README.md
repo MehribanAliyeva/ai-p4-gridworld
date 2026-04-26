@@ -36,8 +36,8 @@ Useful options:
 
 ```bash
 python3 main.py \
+  --start-world 4 \
   --max-steps 300 \
-  --campaign-world-start 1 \
   --campaign-world-end 10 \
   --traversals-per-world 5 \
   --rows 40 \
@@ -57,6 +57,7 @@ python3 main.py \
 Key flags:
 
 - `--rows`, `--cols`: grid dimensions used for state indexing and Q-table shape.
+- `--start-world`: begin the campaign from a specific world, such as `--start-world 4`.
 - `--campaign-world-start`, `--campaign-world-end`, `--traversals-per-world`: control the resumable exploration campaign. Defaults are worlds `1..10`, `5` completed traversals each.
 - `--history-limit`: caps stored episode summaries in metadata.
 - `--epsilon-min`, `--epsilon-decay`: keep more exploration active for longer during training.

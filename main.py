@@ -21,7 +21,9 @@ if load_dotenv is not None:
 
 GW_URL = "https://www.notexponential.com/aip2pgaming/api/rl/gw.php"
 SCORE_URL = "https://www.notexponential.com/aip2pgaming/api/rl/score.php"
+RESET_URL = "https://www.notexponential.com/aip2pgaming/api/rl/reset.php"
 DEFAULT_ACTIONS = ["N", "S", "E", "W"]
+ACTION_TO_IDX = {action: idx for idx, action in enumerate(DEFAULT_ACTIONS)}
 DEFAULT_ROWS = 40
 DEFAULT_COLS = 40
 
@@ -72,10 +74,19 @@ class QConfig:
     null_state_terminal_reward_abs: float = 1000.0
     exploration_bonus: float = 1.0
     state_novelty_bonus: float = 0.25
+    unvisited_state_bonus: float = 5.0
+    frontier_bonus: float = 1.5
     eval_mode: bool = False
+    goal_optimization_mode: bool = False
+    frontier_search_prob: float = 0.85
+    loop_penalty_weight: float = 0.5
+    hazard_penalty_multiplier: float = 3.0
+    goal_short_path_bonus: float = 100.0
     campaign_world_start: int = 1
     campaign_world_end: int = 10
     traversals_per_world: int = 5
+    allow_world_switch: bool = False
+    reset_otp: str = ""
 
 
 @dataclass(frozen=True)
@@ -214,6 +225,16 @@ class GridWorldClient:
         ]
         return self._check_response(run_curl(cmd))
 
+    def reset_team(self, otp: str) -> Dict:
+        cmd = [
+            "curl",
+            "-s",
+            "-X",
+            "GET",
+            f"{RESET_URL}?teamId={self.team_id}&otp={otp}",
+            *self._headers(),
+        ]
+        return self._check_response(run_curl(cmd))
 
 class GridWorldResponseParser:
     def __init__(self, grid: GridSpec, null_state_terminal_reward_abs: float = 1000.0):
@@ -441,6 +462,11 @@ class QTableStore:
         meta.setdefault("metrics", {})
         meta.setdefault("totals", {})
         meta.setdefault("warnings", [])
+        meta.setdefault("bad_transitions", [])
+        meta.setdefault("safe_edges", {})
+        meta.setdefault("tried_transitions", [])
+        meta.setdefault("discovered_states", [])
+        meta.setdefault("known_terminal_events", [])
         return meta
 
     def save(
@@ -476,12 +502,18 @@ class CampaignStore:
             world_progress.setdefault("goal_found", False)
             world_progress.setdefault("goal_reward", None)
             world_progress.setdefault("hazards_found", 0)
+            legacy_goal_hits_completed = world_progress.get("optimization_runs_completed")
+            world_progress.setdefault("goal_hits_completed", 0)
             world_progress.setdefault("optimization_runs_completed", 0)
             world_progress.setdefault("terminals_found", 0)
             world_progress.setdefault("last_terminal_kind", None)
             world_progress.setdefault("last_terminal_reward", None)
             world_progress.setdefault("last_known_state", None)
             # Backward compatibility with older progress files.
+            if legacy_goal_hits_completed is not None and int(world_progress["goal_hits_completed"]) == 0:
+                world_progress["goal_hits_completed"] = int(legacy_goal_hits_completed)
+            if legacy_traversals_completed is not None and int(world_progress["goal_hits_completed"]) == 0:
+                world_progress["goal_hits_completed"] = int(legacy_traversals_completed)
             if legacy_traversals_completed is not None and int(world_progress["optimization_runs_completed"]) == 0:
                 world_progress["optimization_runs_completed"] = int(legacy_traversals_completed)
             world_progress.pop("traversals_completed", None)
@@ -505,12 +537,36 @@ class QLearner:
         num_states: int,
         num_actions: int,
         exploration_bonus: float = 0.0,
+        rows: int = DEFAULT_ROWS,
+        cols: int = DEFAULT_COLS,
+        unvisited_state_bonus: float = 0.0,
+        frontier_bonus: float = 0.0,
     ):
         self.alpha = alpha
         self.gamma = gamma
         self.num_states = num_states
         self.num_actions = num_actions
         self.exploration_bonus = exploration_bonus
+        self.rows = rows
+        self.cols = cols
+        self.unvisited_state_bonus = unvisited_state_bonus
+        self.frontier_bonus = frontier_bonus
+
+    def _neighbor_state(self, state: int, action_idx: int) -> Optional[int]:
+        row = state // self.cols
+        col = state % self.cols
+        if action_idx == ACTION_TO_IDX["N"]:
+            row -= 1
+        elif action_idx == ACTION_TO_IDX["S"]:
+            row += 1
+        elif action_idx == ACTION_TO_IDX["E"]:
+            col += 1
+        elif action_idx == ACTION_TO_IDX["W"]:
+            col -= 1
+
+        if 0 <= row < self.rows and 0 <= col < self.cols:
+            return row * self.cols + col
+        return None
 
     def choose_action(
         self,
@@ -518,12 +574,23 @@ class QLearner:
         state: int,
         epsilon: float,
         action_visits: Optional[np.ndarray] = None,
+        state_visits: Optional[np.ndarray] = None,
     ) -> int:
         if random.random() < epsilon:
             return random.randrange(self.num_actions)
         row = q_table[state].astype(np.float64, copy=True)
         if action_visits is not None and self.exploration_bonus > 0:
             row += self.exploration_bonus / np.sqrt(action_visits[state] + 1.0)
+        if state_visits is not None:
+            for action_idx in range(self.num_actions):
+                neighbor_state = self._neighbor_state(state, action_idx)
+                if neighbor_state is None:
+                    row[action_idx] -= 10_000.0
+                    continue
+                if state_visits[neighbor_state] == 0 and self.unvisited_state_bonus > 0:
+                    row[action_idx] += self.unvisited_state_bonus
+                elif self.frontier_bonus > 0:
+                    row[action_idx] += self.frontier_bonus / np.sqrt(state_visits[neighbor_state] + 1.0)
         best_value = np.max(row)
         best_indices = np.flatnonzero(np.isclose(row, best_value))
         return int(random.choice(best_indices.tolist()))
@@ -575,6 +642,10 @@ class QLearningAgent:
             self.grid.num_states,
             self.num_actions,
             exploration_bonus=config.exploration_bonus,
+            rows=self.grid.rows,
+            cols=self.grid.cols,
+            unvisited_state_bonus=config.unvisited_state_bonus,
+            frontier_bonus=config.frontier_bonus,
         )
 
     def save(self) -> None:
@@ -658,11 +729,18 @@ class QLearningAgent:
         metrics["best_episode_reward"] = self.meta.get("best_episode_reward")
         metrics["exploration_bonus"] = float(self.cfg.exploration_bonus)
         metrics["state_novelty_bonus"] = float(self.cfg.state_novelty_bonus)
+        metrics["unvisited_state_bonus"] = float(self.cfg.unvisited_state_bonus)
+        metrics["frontier_bonus"] = float(self.cfg.frontier_bonus)
         metrics["epsilon_min"] = float(self.cfg.epsilon_min)
         metrics["eval_mode"] = bool(self.cfg.eval_mode)
+        metrics["goal_optimization_mode"] = bool(self.cfg.goal_optimization_mode)
+        metrics["frontier_search_prob"] = float(self.cfg.frontier_search_prob)
+        metrics["known_bad_transitions"] = len(self.meta.get("bad_transitions", []))
+        metrics["known_safe_edges"] = len(self.meta.get("safe_edges", {}))
+        metrics["discovered_states"] = len(self.meta.get("discovered_states", []))
 
     def enter_world_once(self) -> int:
-        self._respect_rate_limit("last_enter_ts", self.cfg.enter_delay_sec)
+        # self._respect_rate_limit("last_enter_ts", self.cfg.enter_delay_sec)
         try:
             enter_response = self.client.enter_world(self.cfg.world_id)
             self._mark_call("last_enter_ts")
@@ -702,6 +780,117 @@ class QLearningAgent:
             return state
         raise GridWorldAPIError("Could not determine current state from location API.")
 
+    def _transition_key(self, state: int, action: str) -> str:
+        return f"{state}:{action}"
+
+    def _remember_discovered_state(self, state: Optional[int]) -> None:
+        if state is None or not self.grid.contains_state(state):
+            return
+        discovered = self.meta.setdefault("discovered_states", [])
+        state_int = int(state)
+        if state_int not in discovered:
+            discovered.append(state_int)
+
+    def _remember_safe_edge(self, state: int, action: str, next_state: Optional[int]) -> None:
+        if next_state is None or not self.grid.contains_state(next_state):
+            return
+        safe_edges = self.meta.setdefault("safe_edges", {})
+        safe_edges[self._transition_key(state, action)] = int(next_state)
+        tried = self.meta.setdefault("tried_transitions", [])
+        key = self._transition_key(state, action)
+        if key not in tried:
+            tried.append(key)
+        self._remember_discovered_state(state)
+        self._remember_discovered_state(next_state)
+
+    def _remember_bad_transition(self, state: int, action: str, reward: float) -> None:
+        bad = self.meta.setdefault("bad_transitions", [])
+        key = self._transition_key(state, action)
+        if key not in bad:
+            bad.append(key)
+        events = self.meta.setdefault("known_terminal_events", [])
+        events.append({
+            "state": int(state),
+            "action": action,
+            "reward": float(reward),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        if len(events) > self.cfg.history_limit:
+            del events[:-self.cfg.history_limit]
+
+    def _avoid_bad_action(self, state: int, action_idx: int) -> int:
+        bad = set(self.meta.get("bad_transitions", []))
+        if not bad:
+            return action_idx
+        candidates = [idx for idx, act in enumerate(self.actions) if self._transition_key(state, act) not in bad]
+        if not candidates:
+            return action_idx
+        action = self.actions[action_idx]
+        if self._transition_key(state, action) not in bad:
+            return action_idx
+        q_values = self.q[state, candidates]
+        return int(candidates[int(np.argmax(q_values))])
+
+    def _frontier_action(self, state: int) -> Optional[int]:
+        bad = set(self.meta.get("bad_transitions", []))
+        tried = set(self.meta.get("tried_transitions", []))
+        safe_edges = self.meta.get("safe_edges", {})
+
+        current_candidates = []
+        for idx, act in enumerate(self.actions):
+            key = self._transition_key(state, act)
+            neighbor = self.learner._neighbor_state(state, idx)
+            if neighbor is None or key in bad:
+                continue
+            if key not in tried:
+                current_candidates.append(idx)
+        if current_candidates:
+            min_visits = min(self.action_visits[state, idx] for idx in current_candidates)
+            best = [idx for idx in current_candidates if self.action_visits[state, idx] == min_visits]
+            return int(random.choice(best))
+
+        graph: Dict[int, List[Tuple[int, int]]] = {}
+        for key, next_state in safe_edges.items():
+            try:
+                s_str, action = key.split(":", 1)
+                s_int = int(s_str)
+                a_idx = ACTION_TO_IDX.get(action)
+                n_int = int(next_state)
+            except Exception:
+                continue
+            if a_idx is None:
+                continue
+            graph.setdefault(s_int, []).append((n_int, a_idx))
+
+        queue: List[Tuple[int, Optional[int]]] = [(state, None)]
+        seen = {state}
+        q_pos = 0
+        while q_pos < len(queue):
+            cur, first_action = queue[q_pos]
+            q_pos += 1
+            for idx, act in enumerate(self.actions):
+                key = self._transition_key(cur, act)
+                neighbor = self.learner._neighbor_state(cur, idx)
+                if neighbor is None or key in bad:
+                    continue
+                if key not in tried:
+                    return int(first_action if first_action is not None else idx)
+            for nxt, a_idx in graph.get(cur, []):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append((nxt, a_idx if first_action is None else first_action))
+        return None
+
+    def _choose_exploration_action(self, state: int, epsilon: float) -> int:
+        if (not self.cfg.eval_mode and not self.cfg.goal_optimization_mode and random.random() < self.cfg.frontier_search_prob):
+            frontier_idx = self._frontier_action(state)
+            if frontier_idx is not None:
+                return self._avoid_bad_action(state, frontier_idx)
+        action_idx = self.learner.choose_action(
+            self.q, state, epsilon, self.action_visits, None if self.cfg.eval_mode else self.state_visits,
+        )
+        return self._avoid_bad_action(state, action_idx)
+
     def run_episode(self, episode_index: int, initial_state: int) -> Dict:
         epsilon = 0.0 if self.cfg.eval_mode else float(self.meta.get("epsilon", self.cfg.epsilon))
         state = initial_state
@@ -712,7 +901,9 @@ class QLearningAgent:
         blocked_moves = 0
         invalid_moves = 0
         assumed_terminal_events = 0
+        ended_by_step_limit = False
         visited_states = [state]
+        episode_state_counts = {}
         action_counts = {action: 0 for action in self.actions}
         step = 0
         terminal_reward = None
@@ -722,17 +913,19 @@ class QLearningAgent:
             if not self.grid.contains_state(state):
                 raise GridWorldAPIError(f"Invalid state index: {state}")
 
+            episode_state_counts[state] = episode_state_counts.get(state, 0) + 1
+
             if not self.cfg.eval_mode:
                 self.state_visits[state] += 1.0
             self._bump_total(f"state_{state}_visits")
-            action_idx = self.learner.choose_action(self.q, state, epsilon, self.action_visits)
+            action_idx = self._choose_exploration_action(state, epsilon)
             action = self.actions[action_idx]
             action_counts[action] += 1
             self._bump_total(f"action_{action}_count")
             if not self.cfg.eval_mode:
                 self.action_visits[state, action_idx] += 1.0
 
-            self._respect_rate_limit("last_move_ts", self.cfg.move_delay_sec)
+            # self._respect_rate_limit("last_move_ts", self.cfg.move_delay_sec)
             move_data = self.client.move(self.cfg.world_id, action)
             self._mark_call("last_move_ts")
 
@@ -761,7 +954,31 @@ class QLearningAgent:
                     print(f"Warning: {warning}")
 
             novelty_reward = self._state_novelty_reward(next_state, done)
-            policy_reward = reward + novelty_reward
+            loop_penalty = 0.0
+            if next_state is not None and self.grid.contains_state(next_state):
+                revisits = max(0, episode_state_counts.get(next_state, 0) - 1)
+                loop_penalty = -float(self.cfg.loop_penalty_weight) * revisits
+
+            if done and reward < 0:
+                self._remember_bad_transition(state, action, reward)
+            elif next_state is not None and self.grid.contains_state(next_state):
+                self._remember_safe_edge(state, action, next_state)
+
+            if self.cfg.goal_optimization_mode:
+                if done and reward > 0:
+                    policy_reward = reward + (float(self.cfg.goal_short_path_bonus) / max(1, step))
+                elif done and reward < 0:
+                    policy_reward = reward * float(self.cfg.hazard_penalty_multiplier)
+                else:
+                    policy_reward = reward + loop_penalty
+            else:
+                if done and reward < 0:
+                    policy_reward = reward * float(self.cfg.hazard_penalty_multiplier)
+                elif done and reward > 0:
+                    policy_reward = reward + (float(self.cfg.goal_short_path_bonus) / max(1, step))
+                else:
+                    policy_reward = reward + novelty_reward + loop_penalty
+
             td_error = 0.0
             if not self.cfg.eval_mode:
                 td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
@@ -792,6 +1009,10 @@ class QLearningAgent:
 
             state = next_state
 
+        if not done and step >= self.cfg.max_steps_per_episode:
+            done = True
+            ended_by_step_limit = True
+
         if not self.cfg.eval_mode:
             epsilon = max(self.cfg.epsilon_min, epsilon * self.cfg.epsilon_decay)
             self.meta["epsilon"] = epsilon
@@ -815,7 +1036,8 @@ class QLearningAgent:
             "mean_abs_td_error": float(total_td_error / max(1, step)),
             "terminal_reward": terminal_reward,
             "terminal_kind": terminal_kind,
-            "final_state": None if done else int(state),
+            "ended_by_step_limit": ended_by_step_limit,
+            "final_state": None if terminal_kind is not None else (int(state) if self.grid.contains_state(state) else None),
             "action_counts": action_counts,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -877,7 +1099,7 @@ class CampaignRunner:
     def _world_is_complete(self, world_id: int) -> bool:
         world_progress = self._world_progress(world_id)
         return bool(world_progress["goal_found"]) and (
-            int(world_progress["optimization_runs_completed"]) >= self.cfg.traversals_per_world
+            int(world_progress["goal_hits_completed"]) >= self.cfg.traversals_per_world
         )
 
     def _next_incomplete_world(self) -> Optional[int]:
@@ -905,6 +1127,26 @@ class CampaignRunner:
         world_cfg = QConfig(**{**self.cfg.__dict__, "world_id": world_id})
         return QLearningAgent(world_cfg)
 
+    def _force_switch_world(self, current_world_id: int) -> None:
+        if not self.cfg.allow_world_switch:
+            raise GridWorldAPIError(f"Already in world {current_world_id}; finish it")
+        if not self.cfg.reset_otp:
+            raise GridWorldAPIError(
+                "World switching requires a reset OTP. Provide --reset-otp or GRIDWORLD_RESET_OTP."
+            )
+
+        print(
+            f"Currently in world {current_world_id}; resetting team state to world -1 "
+            "before entering the requested world."
+        )
+        response = self.client.reset_team(self.cfg.reset_otp)
+        print(f"RESET RESPONSE: {response}")
+        location = self._get_location_info()
+        if location.world_id != -1:
+            raise GridWorldAPIError(
+                f"Reset completed, but location still reports world {location.world_id} instead of -1."
+            )
+
     def _start_or_resume_world(self, world_id: int) -> Tuple[QLearningAgent, int]:
         agent = self._build_agent(world_id)
         location = self._get_location_info()
@@ -924,36 +1166,56 @@ class CampaignRunner:
             self._save_progress()
             return agent, start_state
 
-        if self.cfg.campaign_world_start <= location.world_id <= self.cfg.campaign_world_end:
-            active_world = int(location.world_id)
-            if not self._world_is_complete(active_world):
-                agent = self._build_agent(active_world)
-                if not agent.grid.contains_state(location.state):
-                    raise GridWorldAPIError(
-                        f"Currently in campaign world {active_world}, but location state is invalid: {location.state}"
-                    )
-                print(f"Detected in-progress exploration in world {active_world}; resuming instead of entering {world_id}.")
-                self.progress["active_world"] = active_world
-                self._save_progress()
-                return agent, int(location.state)
-
-        raise GridWorldAPIError(
-            f"Cannot enter world {world_id} because the team is currently in world {location.world_id}. "
-            "Finish the active run first or reset the team state."
-        )
+        self._respect_enter_rate_limit()
+        start_state = agent.enter_world_once()
+        self._mark_enter()
+        print(f"Entered world {world_id} at state {start_state}.")
+        self.progress["active_world"] = world_id
+        self._save_progress()
+        return agent, start_state
 
     def run(self) -> None:
         while True:
             target_world = self._next_incomplete_world()
             if target_world is None:
                 print(
-                    "Campaign complete: worlds 1-10 have all discovered a goal terminal and finished 5 optimization runs."
+                    "Campaign complete: worlds 1-10 have all discovered a goal terminal and reached it 5 times."
                 )
                 break
 
             try:
                 agent, start_state = self._start_or_resume_world(target_world)
                 world_progress = self._world_progress(agent.cfg.world_id)
+                goal_was_already_found = bool(world_progress["goal_found"])
+
+                if goal_was_already_found:
+                    print(f"World {agent.cfg.world_id} goal already found. Starting goal-optimization run.")
+
+                    # Keep learning enabled. Full eval_mode would freeze Q-values,
+                    # so the agent would not improve the path after the first goal.
+                    agent.cfg.eval_mode = False
+                    agent.cfg.goal_optimization_mode = True
+
+                    # Almost greedy: mostly follows the best known path,
+                    # but keeps tiny exploration to discover shorter alternatives.
+                    agent.meta["epsilon"] = 0.05
+
+                    # Turn off exploration/novelty bonuses during optimization.
+                    # Important: update both cfg and learner, because QLearner stores
+                    # these values internally after construction.
+                    agent.cfg.exploration_bonus = 0.0
+                    agent.cfg.state_novelty_bonus = 0.0
+                    agent.cfg.unvisited_state_bonus = 0.0
+                    agent.cfg.frontier_bonus = 0.0
+                    agent.cfg.frontier_search_prob = 0.05
+                    agent.learner.exploration_bonus = 0.0
+                    agent.learner.unvisited_state_bonus = 0.0
+                    agent.learner.frontier_bonus = 0.0
+
+                    # More aggressive optimization after the goal is known.
+                    agent.learner.alpha = 0.3
+                    agent.learner.gamma = 0.98
+
                 episode_index = int(world_progress["terminals_found"]) + 1
                 summary = agent.run_episode(episode_index, start_state)
                 agent.save()
@@ -970,38 +1232,40 @@ class CampaignRunner:
                     world_progress["terminals_found"] = int(world_progress["terminals_found"]) + 1
                     world_progress["last_terminal_kind"] = summary.get("terminal_kind")
                     world_progress["last_terminal_reward"] = summary.get("terminal_reward")
-                    world_progress["last_known_state"] = None
+                    world_progress["last_known_state"] = summary.get("final_state")
 
                     if summary.get("terminal_kind") == "hazard":
                         world_progress["hazards_found"] = int(world_progress["hazards_found"]) + 1
                         print(
                             f"World {agent.cfg.world_id} hit a hazard terminal "
-                            f"(reward={summary.get('terminal_reward')}). Continuing discovery."
+                            f"(reward={summary.get('terminal_reward')}). Continuing search."
                         )
                     elif summary.get("terminal_kind") == "goal":
-                        if not world_progress["goal_found"]:
+                        if not goal_was_already_found:
                             world_progress["goal_found"] = True
                             world_progress["goal_reward"] = summary.get("terminal_reward")
                             print(
                                 f"World {agent.cfg.world_id} discovered a goal terminal "
-                                f"(reward={summary.get('terminal_reward')}). Starting optimization runs."
+                                f"(reward={summary.get('terminal_reward')}). Starting 5 exploit goal runs."
                             )
                         else:
-                            world_progress["optimization_runs_completed"] = (
-                                int(world_progress["optimization_runs_completed"]) + 1
+                            world_progress["goal_hits_completed"] = (
+                                int(world_progress["goal_hits_completed"]) + 1
                             )
-                            completed = int(world_progress["optimization_runs_completed"])
+                            completed = int(world_progress["goal_hits_completed"])
                             print(
-                                f"World {agent.cfg.world_id} optimization run complete: "
-                                f"{completed}/{self.cfg.traversals_per_world}."
+                                f"World {agent.cfg.world_id} reached the goal again "
+                                f"(reward={summary.get('terminal_reward')}). "
+                                f"Goal hits: {completed}/{self.cfg.traversals_per_world}."
                             )
-
-                    self.progress["active_world"] = None
                 else:
                     print(
-                        f"World {agent.cfg.world_id} run still in progress after {summary['steps']} step(s); "
-                        "progress saved and will resume from current location."
+                        f"World {agent.cfg.world_id} episode completed at the step limit "
+                        f"after {summary['steps']} step(s)."
                     )
+
+                if summary["ended"]:
+                    self.progress["active_world"] = None
 
                 self._save_progress()
             except KeyboardInterrupt:
@@ -1024,11 +1288,11 @@ def parse_args() -> QConfig:
     parser.add_argument("--world-id", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--gamma", type=float, default=0.95)
-    parser.add_argument("--epsilon", type=float, default=0.9)
-    parser.add_argument("--epsilon-min", type=float, default=0.2)
-    parser.add_argument("--epsilon-decay", type=float, default=0.999)
+    parser.add_argument("--epsilon", type=float, default=0.4)
+    parser.add_argument("--epsilon-min", type=float, default=0.05)
+    parser.add_argument("--epsilon-decay", type=float, default=0.95)
     parser.add_argument("--episodes", type=int, default=5)
-    parser.add_argument("--max-steps", type=int, default=50)
+    parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--move-delay", type=float, default=2.0)
     parser.add_argument("--enter-delay", type=float, default=600.0)
     parser.add_argument("--storage-dir", type=str, default="q_data")
@@ -1038,8 +1302,20 @@ def parse_args() -> QConfig:
     parser.add_argument("--location-retries", type=int, default=3)
     parser.add_argument("--location-retry-delay", type=float, default=1.0)
     parser.add_argument("--null-state-terminal-reward", type=float, default=1000.0)
-    parser.add_argument("--exploration-bonus", type=float, default=1.0)
-    parser.add_argument("--state-novelty-bonus", type=float, default=0.25)
+    parser.add_argument("--exploration-bonus", type=float, default=0.2)
+    parser.add_argument("--state-novelty-bonus", type=float, default=0.0)
+    parser.add_argument("--unvisited-state-bonus", type=float, default=1.0)
+    parser.add_argument("--frontier-bonus", type=float, default=0.2)
+    parser.add_argument("--frontier-search-prob", type=float, default=0.85)
+    parser.add_argument("--loop-penalty-weight", type=float, default=0.5)
+    parser.add_argument("--hazard-penalty-multiplier", type=float, default=3.0)
+    parser.add_argument("--goal-short-path-bonus", type=float, default=100.0)
+    parser.add_argument(
+        "--start-world",
+        type=int,
+        default=None,
+        help="Start the campaign from this world number. Equivalent to setting campaign-world-start.",
+    )
     parser.add_argument("--campaign-world-start", type=int, default=1)
     parser.add_argument("--campaign-world-end", type=int, default=10)
     parser.add_argument("--traversals-per-world", type=int, default=5)
@@ -1064,6 +1340,10 @@ def parse_args() -> QConfig:
 
     if not args.team_id or not args.api_key or not args.user_id:
         parser.error("team-id, api-key, and user-id are required, either as flags or environment variables.")
+
+    campaign_world_start = args.start_world if args.start_world is not None else args.campaign_world_start
+    if campaign_world_start > args.campaign_world_end:
+        parser.error("start-world/campaign-world-start cannot be greater than campaign-world-end.")
 
     return QConfig(
         team_id=args.team_id,
@@ -1091,8 +1371,14 @@ def parse_args() -> QConfig:
         null_state_terminal_reward_abs=args.null_state_terminal_reward,
         exploration_bonus=args.exploration_bonus,
         state_novelty_bonus=args.state_novelty_bonus,
+        unvisited_state_bonus=args.unvisited_state_bonus,
+        frontier_bonus=args.frontier_bonus,
+        frontier_search_prob=args.frontier_search_prob,
+        loop_penalty_weight=args.loop_penalty_weight,
+        hazard_penalty_multiplier=args.hazard_penalty_multiplier,
+        goal_short_path_bonus=args.goal_short_path_bonus,
         eval_mode=args.eval_mode,
-        campaign_world_start=args.campaign_world_start,
+        campaign_world_start=campaign_world_start,
         campaign_world_end=args.campaign_world_end,
         traversals_per_world=args.traversals_per_world,
     )

@@ -102,6 +102,28 @@ class LearnerTests(unittest.TestCase):
         chosen = learner.choose_action(q_table, 0, epsilon=0.0, action_visits=visits)
         self.assertEqual(chosen, 1)
 
+    def test_unvisited_state_bonus_prefers_unseen_neighbor(self) -> None:
+        learner = QLearner(
+            alpha=0.1,
+            gamma=0.9,
+            num_states=1600,
+            num_actions=4,
+            exploration_bonus=0.0,
+            rows=40,
+            cols=40,
+            unvisited_state_bonus=5.0,
+            frontier_bonus=0.0,
+        )
+        q_table = np.zeros((1600, 4), dtype=np.float32)
+        action_visits = np.zeros((1600, 4), dtype=np.float32)
+        state_visits = np.ones((1600,), dtype=np.float32)
+        state_visits[1] = 0.0
+        state_visits[40] = 10.0
+        random.seed(0)
+
+        chosen = learner.choose_action(q_table, 0, epsilon=0.0, action_visits=action_visits, state_visits=state_visits)
+        self.assertEqual(chosen, 2)
+
     def test_eval_mode_equivalent_policy_is_greedy_when_epsilon_zero(self) -> None:
         learner = QLearner(alpha=0.1, gamma=0.9, num_states=1, num_actions=4, exploration_bonus=0.0)
         q_table = np.array([[1.0, 5.0, 2.0, 1.0]], dtype=np.float32)
@@ -229,6 +251,31 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(summary["terminal_reward"], -1000.0)
             self.assertIsNone(summary["final_state"])
 
+    def test_run_episode_ends_at_step_limit_without_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = QConfig(
+                team_id=1,
+                api_key="k",
+                user_id="u",
+                storage_dir=tmp_dir,
+                max_steps_per_episode=1,
+                epsilon=0.0,
+                epsilon_min=0.0,
+                exploration_bonus=0.0,
+                state_novelty_bonus=0.0,
+                verbose=False,
+                move_delay_sec=0.0,
+            )
+            agent = QLearningAgent(cfg)
+            agent.client.move = lambda world_id, move: {"reward": -0.1, "newState": 1, "worldId": world_id}
+
+            summary = agent.run_episode(1, 0)
+
+            self.assertTrue(summary["ended"])
+            self.assertTrue(summary["ended_by_step_limit"])
+            self.assertIsNone(summary["terminal_kind"])
+            self.assertEqual(summary["final_state"], 1)
+
     def test_campaign_store_initializes_world_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg = QConfig(team_id=1, api_key="k", user_id="u", storage_dir=tmp_dir)
@@ -236,7 +283,7 @@ class AgentTests(unittest.TestCase):
             progress = store.load(cfg)
 
             self.assertFalse(progress["worlds"]["1"]["goal_found"])
-            self.assertEqual(progress["worlds"]["1"]["optimization_runs_completed"], 0)
+            self.assertEqual(progress["worlds"]["1"]["goal_hits_completed"], 0)
             self.assertEqual(progress["worlds"]["10"]["hazards_found"], 0)
 
     def test_campaign_runner_waits_for_goal_before_world_completion(self) -> None:
@@ -245,7 +292,7 @@ class AgentTests(unittest.TestCase):
             runner = CampaignRunner(cfg)
             world = runner._world_progress(1)
 
-            world["optimization_runs_completed"] = 5
+            world["goal_hits_completed"] = 5
             self.assertFalse(runner._world_is_complete(1))
 
             world["goal_found"] = True
@@ -263,7 +310,7 @@ class AgentTests(unittest.TestCase):
             store = CampaignStore(tmp_dir)
             progress = store.load(cfg)
 
-            self.assertEqual(progress["worlds"]["1"]["optimization_runs_completed"], 3)
+            self.assertEqual(progress["worlds"]["1"]["goal_hits_completed"], 3)
             self.assertNotIn("traversals_completed", progress["worlds"]["1"])
 
 
