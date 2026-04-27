@@ -5,6 +5,7 @@ import random
 import subprocess
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -471,6 +472,8 @@ class QTableStore:
         meta.setdefault("discovered_states", [])
         meta.setdefault("known_terminal_events", [])
         meta.setdefault("state_reward_avg", {})
+        meta.setdefault("goal_entry", None)  # {"state": pre-terminal state, "action": action that reaches goal}
+        meta.setdefault("best_known_goal_path", [])
         return meta
 
     def save(
@@ -557,16 +560,24 @@ class QLearner:
         self.frontier_bonus = frontier_bonus
 
     def _neighbor_state(self, state: int, action_idx: int) -> Optional[int]:
+        """Predict neighbor using the API's observed action mapping.
+
+        From your logs:
+        - N increases state by +1  => column + 1
+        - S decreases state by -1  => column - 1
+        - E increases state by +40 => row + 1
+        - W decreases state by -40 => row - 1
+        """
         row = state // self.cols
         col = state % self.cols
         if action_idx == ACTION_TO_IDX["N"]:
-            row -= 1
-        elif action_idx == ACTION_TO_IDX["S"]:
-            row += 1
-        elif action_idx == ACTION_TO_IDX["E"]:
             col += 1
-        elif action_idx == ACTION_TO_IDX["W"]:
+        elif action_idx == ACTION_TO_IDX["S"]:
             col -= 1
+        elif action_idx == ACTION_TO_IDX["E"]:
+            row += 1
+        elif action_idx == ACTION_TO_IDX["W"]:
+            row -= 1
 
         if 0 <= row < self.rows and 0 <= col < self.cols:
             return row * self.cols + col
@@ -949,6 +960,184 @@ class QLearningAgent:
         )
         return self._avoid_bad_action(state, action_idx)
 
+    def _remember_goal_entry(self, state: int, action: str, reward: float, step: int) -> None:
+        """Remember the pre-terminal state and action that reached the goal.
+
+        Many GridWorld APIs return world=-1 / next_state=-1 for terminal states,
+        so the safest representation of the goal is: be at `state`, take `action`.
+        """
+        goal_entry = {
+            "state": int(state),
+            "action": action,
+            "reward": float(reward),
+            "step_found": int(step),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.meta["goal_entry"] = goal_entry
+        print(f"Saved goal entry: from state {state}, take action {action}.")
+
+    def find_shortest_known_goal_path(self, start_state: int) -> Optional[List[str]]:
+        """Find shortest known path to the saved goal entry using safe_edges.
+
+        Returns a list of actions. The last action is the terminal goal action.
+        If safe_edges are incomplete, returns None and the caller should fall back to Q-learning.
+        """
+        goal_entry = self.meta.get("goal_entry")
+        if not goal_entry:
+            return None
+
+        try:
+            goal_state = int(goal_entry["state"])
+            goal_action = str(goal_entry["action"])
+        except Exception:
+            return None
+
+        safe_edges = self.meta.get("safe_edges", {})
+        bad = set(self.meta.get("bad_transitions", []))
+
+        # Build adjacency list from known safe transitions.
+        graph: Dict[int, List[Tuple[int, str]]] = {}
+        for key, nxt in safe_edges.items():
+            try:
+                s_str, action = key.split(":", 1)
+                s_int = int(s_str)
+                n_int = int(nxt)
+            except Exception:
+                continue
+            if key in bad:
+                continue
+            if not self.grid.contains_state(s_int) or not self.grid.contains_state(n_int):
+                continue
+            graph.setdefault(s_int, []).append((n_int, action))
+
+        # If we are already at the pre-goal state, just take the known terminal action.
+        if int(start_state) == goal_state:
+            return [goal_action]
+
+        queue = deque([(int(start_state), [])])
+        visited = {int(start_state)}
+
+        while queue:
+            state, path = queue.popleft()
+            for next_state, action in graph.get(state, []):
+                if next_state in visited:
+                    continue
+                new_path = path + [action]
+                if next_state == goal_state:
+                    return new_path + [goal_action]
+                visited.add(next_state)
+                queue.append((next_state, new_path))
+
+        return None
+
+    def follow_planned_goal_path(self, episode_index: int, initial_state: int, path: List[str]) -> Dict:
+        """Follow a BFS-planned path, while still updating Q-values and graph memory.
+
+        This is not blind replay: if an edge fails or becomes hazardous, it is recorded as bad.
+        """
+        state = initial_state
+        total_reward = 0.0
+        total_policy_reward = 0.0
+        total_td_error = 0.0
+        visited_states = [state]
+        action_counts = {action: 0 for action in self.actions}
+        terminal_reward = None
+        terminal_kind = None
+        done = False
+        ended_by_step_limit = False
+        step = 0
+
+        for step, action in enumerate(path[: self.cfg.max_steps_per_episode], start=1):
+            if action not in ACTION_TO_IDX:
+                continue
+            action_idx = ACTION_TO_IDX[action]
+            action_counts[action] += 1
+
+            self._respect_rate_limit("last_move_ts", self.cfg.move_delay_sec)
+            move_data = self.client.move(self.cfg.world_id, action)
+            self._mark_call("last_move_ts")
+
+            outcome = self.parser.parse_move_result(move_data, current_state=state)
+            reward = outcome.reward
+            next_state = outcome.next_state
+            done = outcome.done
+
+            if next_state is None and not done:
+                next_state = self._safe_get_location()
+                if next_state is None:
+                    next_state = state
+
+            self._update_state_reward_avg(next_state, reward)
+
+            if done and reward < 0:
+                self._remember_bad_transition(state, action, reward)
+                policy_reward = reward * float(self.cfg.hazard_penalty_multiplier)
+            elif done and reward > 0:
+                self._remember_goal_entry(state, action, reward, step)
+                policy_reward = reward + (float(self.cfg.goal_short_path_bonus) / max(1, step))
+            else:
+                self._remember_safe_edge(state, action, next_state)
+                policy_reward = reward
+
+            if not self.cfg.eval_mode:
+                td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
+                total_td_error += abs(td_error)
+
+            total_reward += reward
+            total_policy_reward += policy_reward
+            if next_state is not None:
+                visited_states.append(next_state)
+
+            if self.cfg.verbose:
+                print(
+                    f"[BFS-PATH] Episode {episode_index} | Step {step:03d} | State {state:4d} | "
+                    f"Action {action:>5s} | Reward {reward:8.3f} | "
+                    f"PolicyReward {policy_reward:8.3f} | Next {str(next_state):>4s} | Done={done}"
+                )
+
+            if done:
+                terminal_reward = float(reward)
+                terminal_kind = "hazard" if reward < 0 else "goal"
+                if terminal_kind == "goal":
+                    self._remember_goal_entry(state, action, reward, step)
+                self._bump_total("terminal_episodes")
+                break
+
+            state = int(next_state)
+
+        if not done and step >= self.cfg.max_steps_per_episode:
+            done = True
+            ended_by_step_limit = True
+
+        summary = {
+            "episode": episode_index,
+            "total_reward": float(total_reward),
+            "total_policy_reward": float(total_policy_reward),
+            "steps": step,
+            "ended": done,
+            "epsilon_after": float(self.meta.get("epsilon", self.cfg.epsilon)),
+            "unique_states": len(set(visited_states)),
+            "blocked_moves": 0,
+            "invalid_moves": 0,
+            "assumed_terminal_events": 0,
+            "mean_abs_td_error": float(total_td_error / max(1, step)),
+            "terminal_reward": terminal_reward,
+            "terminal_kind": terminal_kind,
+            "ended_by_step_limit": ended_by_step_limit,
+            "final_state": None if terminal_kind is not None else (int(state) if self.grid.contains_state(state) else None),
+            "action_counts": action_counts,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": "bfs_shortest_known_goal_path",
+            "planned_path_len": len(path),
+        }
+
+        history = self.meta.setdefault("history", [])
+        history.append(summary)
+        if len(history) > self.cfg.history_limit:
+            del history[:-self.cfg.history_limit]
+        self._update_running_metrics(summary)
+        return summary
+
     def run_episode(self, episode_index: int, initial_state: int) -> Dict:
         epsilon = 0.0 if self.cfg.eval_mode else float(self.meta.get("epsilon", self.cfg.epsilon))
         state = initial_state
@@ -1116,6 +1305,244 @@ class QLearningAgent:
         self._update_running_metrics(episode_summary)
         return episode_summary
 
+
+    def _state_to_row_col(self, state: int) -> Tuple[int, int]:
+        return int(state) // self.grid.cols, int(state) % self.grid.cols
+
+    def _coordinate_action_candidates(
+        self,
+        state: int,
+        target_state: int,
+        prev_state: Optional[int] = None,
+    ) -> List[int]:
+        """Return actions ordered by greedy movement toward target_state.
+
+        Grid encoding is row * cols + col, but the API action names are observed as:
+        - N = column + 1
+        - S = column - 1
+        - E = row + 1
+        - W = row - 1
+
+        Hazards are handled by bad_transitions; this only provides a goal-direction fallback.
+        """
+        row, col = self._state_to_row_col(state)
+        target_row, target_col = self._state_to_row_col(target_state)
+        d_row = target_row - row
+        d_col = target_col - col
+
+        primary: List[str] = []
+        secondary: List[str] = []
+
+        vertical = "E" if d_row > 0 else "W" if d_row < 0 else None
+        horizontal = "N" if d_col > 0 else "S" if d_col < 0 else None
+
+        if abs(d_row) >= abs(d_col):
+            if vertical is not None:
+                primary.append(vertical)
+            if horizontal is not None:
+                primary.append(horizontal)
+        else:
+            if horizontal is not None:
+                primary.append(horizontal)
+            if vertical is not None:
+                primary.append(vertical)
+
+        # Add remaining actions as fallback, ranked by current Q-value.
+        used = set(primary)
+        q_ranked = sorted(
+            [a for a in self.actions if a not in used],
+            key=lambda a: float(self.q[state, ACTION_TO_IDX[a]]),
+            reverse=True,
+        )
+        secondary.extend(q_ranked)
+
+        ordered_actions = primary + secondary
+        bad = set(self.meta.get("bad_transitions", []))
+        candidates: List[int] = []
+
+        for action in ordered_actions:
+            idx = ACTION_TO_IDX[action]
+            neighbor = self.learner._neighbor_state(state, idx)
+            if neighbor is None:
+                continue
+            if self._transition_key(state, action) in bad:
+                continue
+            # Avoid immediately going backward if another candidate exists.
+            if prev_state is not None and neighbor == prev_state:
+                continue
+            candidates.append(idx)
+
+        if candidates:
+            return candidates
+
+        # If all non-backtracking candidates were filtered, allow backtracking but still avoid known hazards.
+        for action in ordered_actions:
+            idx = ACTION_TO_IDX[action]
+            neighbor = self.learner._neighbor_state(state, idx)
+            if neighbor is None:
+                continue
+            if self._transition_key(state, action) in bad:
+                continue
+            candidates.append(idx)
+
+        if candidates:
+            return candidates
+
+        # Last resort: any valid in-grid action.
+        for action in self.actions:
+            idx = ACTION_TO_IDX[action]
+            if self.learner._neighbor_state(state, idx) is not None:
+                candidates.append(idx)
+
+        return candidates or [random.randrange(self.num_actions)]
+
+    def coordinate_exploit_to_goal(self, episode_index: int, initial_state: int) -> Dict:
+        """Exploit toward the known goal entry using coordinates.
+
+        Priority:
+        1. If already at the saved pre-goal state, take the saved terminal goal action.
+        2. Otherwise, greedily reduce Manhattan distance to the pre-goal state.
+        3. Avoid known bad/hazard transitions.
+        4. If the chosen direction fails, the transition is remembered and future runs avoid it.
+
+        This is faster than generic Q-learning when there are no walls, but hazards may still
+        sit on the direct route, so BFS safe path remains preferred whenever available.
+        """
+        goal_entry = self.meta.get("goal_entry")
+        if not goal_entry:
+            raise GridWorldAPIError("No known goal entry for coordinate exploit.")
+
+        goal_state = int(goal_entry["state"])
+        goal_action = str(goal_entry["action"])
+
+        state = int(initial_state)
+        total_reward = 0.0
+        total_policy_reward = 0.0
+        total_td_error = 0.0
+        visited_states = [state]
+        action_counts = {action: 0 for action in self.actions}
+        terminal_reward = None
+        terminal_kind = None
+        done = False
+        ended_by_step_limit = False
+        step = 0
+
+        print(
+            f"[COORD-EXPLOIT] Target pre-goal state={goal_state}, terminal action={goal_action}."
+        )
+
+        for step in range(1, self.cfg.max_steps_per_episode + 1):
+            prev_state = visited_states[-2] if len(visited_states) >= 2 else None
+
+            if state == goal_state and goal_action in ACTION_TO_IDX:
+                action_idx = ACTION_TO_IDX[goal_action]
+            else:
+                candidates = self._coordinate_action_candidates(state, goal_state, prev_state)
+                action_idx = candidates[0]
+
+            action = self.actions[action_idx]
+            action_counts[action] += 1
+
+            self._respect_rate_limit("last_move_ts", self.cfg.move_delay_sec)
+            move_data = self.client.move(self.cfg.world_id, action)
+            self._mark_call("last_move_ts")
+
+            outcome = self.parser.parse_move_result(move_data, current_state=state)
+            reward = outcome.reward
+            next_state = outcome.next_state
+            done = outcome.done
+
+            if next_state is None and not done:
+                next_state = self._safe_get_location()
+                if next_state is None:
+                    next_state = state
+
+            self._update_state_reward_avg(next_state, reward)
+
+            if done and reward < 0:
+                self._remember_bad_transition(state, action, reward)
+                policy_reward = reward * float(self.cfg.hazard_penalty_multiplier)
+            elif done and reward > 0:
+                self._remember_goal_entry(state, action, reward, step)
+                policy_reward = reward + (float(self.cfg.goal_short_path_bonus) / max(1, step))
+            else:
+                self._remember_safe_edge(state, action, next_state)
+
+                # For coordinate exploit, use a small Manhattan-distance shaping term.
+                # This is only used after goal is known.
+                old_dist = abs(self._state_to_row_col(state)[0] - self._state_to_row_col(goal_state)[0]) + abs(
+                    self._state_to_row_col(state)[1] - self._state_to_row_col(goal_state)[1]
+                )
+                new_dist = old_dist
+                if next_state is not None and self.grid.contains_state(next_state):
+                    new_dist = abs(self._state_to_row_col(int(next_state))[0] - self._state_to_row_col(goal_state)[0]) + abs(
+                        self._state_to_row_col(int(next_state))[1] - self._state_to_row_col(goal_state)[1]
+                    )
+                progress_bonus = 0.25 if new_dist < old_dist else -0.25 if new_dist > old_dist else 0.0
+                self_loop_penalty = -1.0 if next_state == state else 0.0
+                policy_reward = reward + progress_bonus + self_loop_penalty
+
+            if not self.cfg.eval_mode:
+                td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
+                total_td_error += abs(td_error)
+
+            total_reward += reward
+            total_policy_reward += policy_reward
+
+            if next_state is not None:
+                visited_states.append(int(next_state))
+
+            if self.cfg.verbose:
+                print(
+                    f"[COORD-EXPLOIT] Episode {episode_index} | Step {step:03d} | State {state:4d} | "
+                    f"Action {action:>5s} | Reward {reward:8.3f} | "
+                    f"PolicyReward {policy_reward:8.3f} | Next {str(next_state):>4s} | Done={done}"
+                )
+
+            if done:
+                terminal_reward = float(reward)
+                terminal_kind = "hazard" if reward < 0 else "goal"
+                self._bump_total("terminal_episodes")
+                break
+
+            state = int(next_state)
+
+        if not done and step >= self.cfg.max_steps_per_episode:
+            done = True
+            ended_by_step_limit = True
+
+        summary = {
+            "episode": episode_index,
+            "total_reward": float(total_reward),
+            "total_policy_reward": float(total_policy_reward),
+            "steps": step,
+            "ended": done,
+            "epsilon_after": float(self.meta.get("epsilon", self.cfg.epsilon)),
+            "unique_states": len(set(visited_states)),
+            "blocked_moves": 0,
+            "invalid_moves": 0,
+            "assumed_terminal_events": 0,
+            "mean_abs_td_error": float(total_td_error / max(1, step)),
+            "terminal_reward": terminal_reward,
+            "terminal_kind": terminal_kind,
+            "ended_by_step_limit": ended_by_step_limit,
+            "final_state": None if terminal_kind is not None else (int(state) if self.grid.contains_state(state) else None),
+            "action_counts": action_counts,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": "coordinate_exploit",
+            "target_goal_state": goal_state,
+            "target_goal_action": goal_action,
+        }
+
+        history = self.meta.setdefault("history", [])
+        history.append(summary)
+        if len(history) > self.cfg.history_limit:
+            del history[:-self.cfg.history_limit]
+
+        self._update_running_metrics(summary)
+        return summary
+
+
     def train(self) -> None:
         current_state = self.enter_world_once()
         for episode in range(1, self.cfg.max_episodes + 1):
@@ -1156,9 +1583,10 @@ class CampaignRunner:
         self.store = CampaignStore(config.storage_dir)
         self.progress = self.store.load(config)
 
-    def _save_progress(self) -> None:
         self.store.save(self.progress)
+    def _save_progress(self) -> None:
 
+        self.store.save(self.progress)
     def _world_progress(self, world_id: int) -> Dict:
         return self.progress["worlds"][str(world_id)]
 
@@ -1245,7 +1673,7 @@ class CampaignRunner:
             target_world = self._next_incomplete_world()
             if target_world is None:
                 print(
-                    "Campaign complete: worlds 1-10 have all discovered a goal terminal and reached it 5 times."
+                    "Campaign complete: selected world range has reached the required goal hits."
                 )
                 break
 
@@ -1286,7 +1714,34 @@ class CampaignRunner:
                     agent.cfg.goal_backtrack_penalty = max(agent.cfg.goal_backtrack_penalty, 0.3)
 
                 episode_index = int(world_progress["terminals_found"]) + 1
-                summary = agent.run_episode(episode_index, start_state)
+
+                # If we already found the goal before, use the known safe graph to compute
+                # the shortest currently known path to the saved goal entry. If the graph is
+                # incomplete because older runs did not save safe_edges, fall back to smart Q-learning
+                # and keep recording safe_edges until BFS becomes possible.
+                summary = None
+                if goal_was_already_found:
+                    planned_path = agent.find_shortest_known_goal_path(start_state)
+                    if planned_path:
+                        print(
+                            f"Using BFS shortest known goal path for world {agent.cfg.world_id}: "
+                            f"{len(planned_path)} action(s)."
+                        )
+                        summary = agent.follow_planned_goal_path(episode_index, start_state, planned_path)
+                    elif agent.meta.get("goal_entry"):
+                        print(
+                            "No complete safe-edge path to goal yet. Using coordinate-biased exploit "
+                            "because this world has no walls. This will also record safe_edges for future BFS."
+                        )
+                        summary = agent.coordinate_exploit_to_goal(episode_index, start_state)
+                    else:
+                        print(
+                            "No goal entry and no complete safe-edge path yet. Falling back to goal-biased Q-learning "
+                            "and recording safe_edges for future BFS."
+                        )
+
+                if summary is None:
+                    summary = agent.run_episode(episode_index, start_state)
                 agent.save()
 
                 self.progress["active_world"] = agent.cfg.world_id
@@ -1388,9 +1843,9 @@ def parse_args() -> QConfig:
         default=None,
         help="Start the campaign from this world number. Equivalent to setting campaign-world-start.",
     )
-    parser.add_argument("--campaign-world-start", type=int, default=1)
-    parser.add_argument("--campaign-world-end", type=int, default=10)
-    parser.add_argument("--traversals-per-world", type=int, default=5)
+    parser.add_argument("--campaign-world-start", type=int, default=2)
+    parser.add_argument("--campaign-world-end", type=int, default=2)
+    parser.add_argument("--traversals-per-world", type=int, default=3)
     parser.add_argument(
         "--eval-mode",
         action="store_true",

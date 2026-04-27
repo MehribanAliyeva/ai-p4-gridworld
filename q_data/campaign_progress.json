@@ -2,11 +2,11 @@
   "worlds": {
     "1": {
       "goal_found": true,
-      "goal_reward": 10000.0,
-      "hazards_found": 6,
-      "goal_hits_completed": 0,
+      "goal_reward": 1.0,
+      "hazards_found": 7,
+      "goal_hits_completed": 3,
       "optimization_runs_completed": 0,
-      "terminals_found": 38,
+      "terminals_found": 49,
       "last_terminal_kind": "goal",
       "last_terminal_reward": 10000.0,
       "last_known_state": null
@@ -17,10 +17,10 @@
       "hazards_found": 0,
       "goal_hits_completed": 0,
       "optimization_runs_completed": 0,
-      "terminals_found": 0,
+      "terminals_found": 2,
       "last_terminal_kind": null,
       "last_terminal_reward": null,
-      "last_known_state": null
+      "last_known_state": 825
     },
     "3": {
       "goal_found": false,
@@ -111,33 +111,33 @@
       "last_known_state": null
     }
   },
-  "active_world": 1,
-  "last_enter_ts": 1777187305.8943439,
+  "active_world": 2,
+  "last_enter_ts": 1777232524.498333,
   "last_summary": {
-    "world_id": 1,
-    "terminal_attempt": 38,
-    "episode": 38,
-    "total_reward": 10253.87,
-    "total_policy_reward": 10164.12706940874,
-    "steps": 389,
+    "world_id": 2,
+    "terminal_attempt": 2,
+    "episode": 2,
+    "total_reward": 500.0,
+    "total_policy_reward": 466.6999999999997,
+    "steps": 500,
     "ended": true,
-    "epsilon_after": 0.5142675432401955,
-    "unique_states": 165,
+    "epsilon_after": 0.361,
+    "unique_states": 207,
     "blocked_moves": 0,
     "invalid_moves": 0,
-    "assumed_terminal_events": 1,
-    "mean_abs_td_error": 26.32408596183845,
-    "terminal_reward": 10000.0,
-    "terminal_kind": "goal",
-    "ended_by_step_limit": false,
-    "final_state": null,
+    "assumed_terminal_events": 0,
+    "mean_abs_td_error": 0.984671092506497,
+    "terminal_reward": null,
+    "terminal_kind": null,
+    "ended_by_step_limit": true,
+    "final_state": 825,
     "action_counts": {
-      "N": 90,
-      "S": 98,
-      "E": 99,
-      "W": 102
+      "N": 114,
+      "S": 134,
+      "E": 119,
+      "W": 133
     },
-    "timestamp": "2026-04-26 11:08:24"
+    "timestamp": "2026-04-27 07:34:48"
   },
   "campaign_world_start": 1,
   "campaign_world_end": 10,
