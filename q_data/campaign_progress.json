@@ -12,21 +12,21 @@
       "last_known_state": null
     },
     "2": {
-      "goal_found": false,
-      "goal_reward": null,
+      "goal_found": true,
+      "goal_reward": 1000.0,
       "hazards_found": 0,
-      "goal_hits_completed": 0,
+      "goal_hits_completed": 5,
       "optimization_runs_completed": 0,
-      "terminals_found": 2,
-      "last_terminal_kind": null,
-      "last_terminal_reward": null,
-      "last_known_state": 825
+      "terminals_found": 21,
+      "last_terminal_kind": "goal",
+      "last_terminal_reward": 1000.0,
+      "last_known_state": null
     },
     "3": {
-      "goal_found": false,
-      "goal_reward": null,
+      "goal_found": true,
+      "goal_reward": 0.0,
       "hazards_found": 0,
-      "goal_hits_completed": 0,
+      "goal_hits_completed": 5,
       "optimization_runs_completed": 0,
       "terminals_found": 0,
       "last_terminal_kind": null,
@@ -39,10 +39,10 @@
       "hazards_found": 0,
       "goal_hits_completed": 0,
       "optimization_runs_completed": 0,
-      "terminals_found": 0,
+      "terminals_found": 6,
       "last_terminal_kind": null,
       "last_terminal_reward": null,
-      "last_known_state": null
+      "last_known_state": 1263
     },
     "5": {
       "goal_found": false,
@@ -111,33 +111,33 @@
       "last_known_state": null
     }
   },
-  "active_world": 2,
-  "last_enter_ts": 1777232524.498333,
+  "active_world": 4,
+  "last_enter_ts": 1777376397.381665,
   "last_summary": {
-    "world_id": 2,
-    "terminal_attempt": 2,
-    "episode": 2,
-    "total_reward": 500.0,
-    "total_policy_reward": 466.6999999999997,
+    "world_id": 4,
+    "terminal_attempt": 6,
+    "episode": 6,
+    "total_reward": 59.47000000000012,
+    "total_policy_reward": 37.26999999999998,
     "steps": 500,
     "ended": true,
-    "epsilon_after": 0.361,
-    "unique_states": 207,
+    "epsilon_after": 0.2793349184374999,
+    "unique_states": 221,
     "blocked_moves": 0,
     "invalid_moves": 0,
     "assumed_terminal_events": 0,
-    "mean_abs_td_error": 0.984671092506497,
+    "mean_abs_td_error": 0.11088140801398313,
     "terminal_reward": null,
     "terminal_kind": null,
     "ended_by_step_limit": true,
-    "final_state": 825,
+    "final_state": 1263,
     "action_counts": {
-      "N": 114,
-      "S": 134,
-      "E": 119,
-      "W": 133
+      "N": 129,
+      "S": 113,
+      "E": 121,
+      "W": 137
     },
-    "timestamp": "2026-04-27 07:34:48"
+    "timestamp": "2026-04-29 05:24:45"
   },
   "campaign_world_start": 1,
   "campaign_world_end": 10,

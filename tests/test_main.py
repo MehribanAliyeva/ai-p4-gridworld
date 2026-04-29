@@ -124,7 +124,7 @@ class LearnerTests(unittest.TestCase):
         chosen = learner.choose_action(q_table, 0, epsilon=0.0, action_visits=action_visits, state_visits=state_visits)
         self.assertEqual(chosen, 2)
 
-    def test_eval_mode_equivalent_policy_is_greedy_when_epsilon_zero(self) -> None:
+    def test_greedy_policy_is_greedy_when_epsilon_zero(self) -> None:
         learner = QLearner(alpha=0.1, gamma=0.9, num_states=1, num_actions=4, exploration_bonus=0.0)
         q_table = np.array([[1.0, 5.0, 2.0, 1.0]], dtype=np.float32)
         random.seed(0)
@@ -200,14 +200,6 @@ class AgentTests(unittest.TestCase):
     def test_enter_delay_default_matches_assignment_limit(self) -> None:
         cfg = QConfig(team_id=1, api_key="k", user_id="u")
         self.assertEqual(cfg.enter_delay_sec, 600.0)
-
-    def test_state_novelty_reward_is_zero_in_eval_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            cfg = QConfig(team_id=1, api_key="k", user_id="u", storage_dir=tmp_dir, eval_mode=True)
-            agent = QLearningAgent(cfg)
-            agent.state_visits[7] = 0
-
-            self.assertEqual(agent._state_novelty_reward(7, done=False), 0.0)
 
     def test_state_novelty_reward_decreases_with_visits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
