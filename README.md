@@ -66,7 +66,6 @@ Key flags:
 - `--enter-delay`: defaults to `600` seconds to respect the assignment rule of no more than one `enter` call every 10 minutes.
 - `--location-retries`, `--location-retry-delay`: retry `location` after incomplete move responses before falling back to a self-loop.
 - `--null-state-terminal-reward`: if `nextState` is `null` and `abs(reward)` reaches this threshold, the move is treated as an assumed terminal outcome.
-- `--eval-mode`: disables exploration and learning updates so you can run the current policy greedily for measurement.
 - `--strict-missing-state`: fail the episode if a move response and fallback location lookup both omit the next state. By default the agent assumes a self-loop and records a warning.
 - `--quiet`: suppresses per-step logging.
 

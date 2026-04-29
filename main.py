@@ -28,7 +28,6 @@ ACTION_TO_IDX = {action: idx for idx, action in enumerate(DEFAULT_ACTIONS)}
 DEFAULT_ROWS = 40
 DEFAULT_COLS = 40
 
-
 @dataclass(frozen=True)
 class GridSpec:
     rows: int = DEFAULT_ROWS
@@ -45,7 +44,6 @@ class GridSpec:
         if 0 <= row < self.rows and 0 <= col < self.cols:
             return row * self.cols + col
         return None
-
 
 @dataclass
 class QConfig:
@@ -77,9 +75,12 @@ class QConfig:
     state_novelty_bonus: float = 0.25
     unvisited_state_bonus: float = 5.0
     frontier_bonus: float = 1.5
-    eval_mode: bool = False
     goal_optimization_mode: bool = False
     frontier_search_prob: float = 0.85
+    wall_min_trials: int = 6
+    wall_self_loop_threshold: float = 0.55
+    wall_forward_threshold: float = 0.2
+    wall_push_retry_limit: int = 6
     loop_penalty_weight: float = 0.1
     hazard_penalty_multiplier: float = 3.0
     goal_short_path_bonus: float = 300.0
@@ -92,12 +93,10 @@ class QConfig:
     allow_world_switch: bool = False
     reset_otp: str = ""
 
-
 @dataclass(frozen=True)
 class LocationInfo:
     world_id: int
     state: Optional[int]
-
 
 @dataclass(frozen=True)
 class MoveOutcome:
@@ -109,10 +108,8 @@ class MoveOutcome:
     assumed_terminal: bool
     raw: Dict
 
-
 class GridWorldAPIError(Exception):
     pass
-
 
 def run_curl(command: List[str], retries: int = 2, retry_delay: float = 2.0) -> Dict:
     last_error = None
@@ -146,7 +143,6 @@ def run_curl(command: List[str], retries: int = 2, retry_delay: float = 2.0) -> 
             time.sleep(retry_delay)
 
     raise last_error
-
 
 class GridWorldClient:
     def __init__(self, team_id: int, api_key: str, user_id: str):
@@ -386,7 +382,6 @@ class GridWorldResponseParser:
             raw=data,
         )
 
-
 class QTableStore:
     def __init__(self, storage_dir: str, world_id: int):
         self.storage = Path(storage_dir)
@@ -469,6 +464,8 @@ class QTableStore:
         meta.setdefault("bad_transitions", [])
         meta.setdefault("safe_edges", {})
         meta.setdefault("tried_transitions", [])
+        meta.setdefault("transition_stats", {})
+        meta.setdefault("frontier_push", None)
         meta.setdefault("discovered_states", [])
         meta.setdefault("known_terminal_events", [])
         meta.setdefault("state_reward_avg", {})
@@ -487,7 +484,6 @@ class QTableStore:
         self._atomic_write_npy(self.visits_path, action_visits)
         self._atomic_write_npy(self.state_visits_path, state_visits)
         self._atomic_write_json(self.meta_path, meta)
-
 
 class CampaignStore:
     def __init__(self, storage_dir: str):
@@ -534,7 +530,6 @@ class CampaignStore:
 
     def save(self, progress: Dict) -> None:
         QTableStore._atomic_write_json(self.progress_path, progress)
-
 
 class QLearner:
     def __init__(
@@ -629,7 +624,6 @@ class QLearner:
         q_table[state, action_idx] = current_q + self.alpha * td_error
         return float(td_error)
 
-
 class QLearningAgent:
     def __init__(self, config: QConfig):
         self.cfg = config
@@ -718,7 +712,7 @@ class QLearningAgent:
             del warnings[:-self.cfg.history_limit]
 
     def _state_novelty_reward(self, next_state: Optional[int], done: bool) -> float:
-        if self.cfg.eval_mode or done or next_state is None or not self.grid.contains_state(next_state):
+        if done or next_state is None or not self.grid.contains_state(next_state):
             return 0.0
         if self.cfg.state_novelty_bonus <= 0:
             return 0.0
@@ -747,11 +741,16 @@ class QLearningAgent:
         metrics["unvisited_state_bonus"] = float(self.cfg.unvisited_state_bonus)
         metrics["frontier_bonus"] = float(self.cfg.frontier_bonus)
         metrics["epsilon_min"] = float(self.cfg.epsilon_min)
-        metrics["eval_mode"] = bool(self.cfg.eval_mode)
         metrics["goal_optimization_mode"] = bool(self.cfg.goal_optimization_mode)
         metrics["frontier_search_prob"] = float(self.cfg.frontier_search_prob)
         metrics["known_bad_transitions"] = len(self.meta.get("bad_transitions", []))
         metrics["known_safe_edges"] = len(self.meta.get("safe_edges", {}))
+        metrics["wall_like_transitions"] = sum(
+            1
+            for key in self.meta.get("transition_stats", {})
+            for state_str, action in [key.split(":", 1)]
+            if state_str.isdigit() and self._is_wall_like_transition(int(state_str), action)
+        )
         metrics["discovered_states"] = len(self.meta.get("discovered_states", []))
 
     def enter_world_once(self) -> int:
@@ -805,6 +804,106 @@ class QLearningAgent:
         state_int = int(state)
         if state_int not in discovered:
             discovered.append(state_int)
+
+    def _mark_tried_transition(self, state: int, action: str) -> None:
+        tried = self.meta.setdefault("tried_transitions", [])
+        key = self._transition_key(state, action)
+        if key not in tried:
+            tried.append(key)
+
+    def _record_transition_outcome(
+        self,
+        state: int,
+        action: str,
+        next_state: Optional[int],
+        done: bool,
+        reward: float,
+    ) -> None:
+        self._mark_tried_transition(state, action)
+        key = self._transition_key(state, action)
+        stats = self.meta.setdefault("transition_stats", {}).setdefault(
+            key,
+            {
+                "tries": 0,
+                "forward": 0,
+                "self_loops": 0,
+                "side_slips": 0,
+                "hazards": 0,
+                "goals": 0,
+                "outcomes": {},
+            },
+        )
+        stats["tries"] = int(stats.get("tries", 0)) + 1
+        intended = self.learner._neighbor_state(state, ACTION_TO_IDX[action])
+
+        if done:
+            if reward < 0:
+                stats["hazards"] = int(stats.get("hazards", 0)) + 1
+            elif reward > 0:
+                stats["goals"] = int(stats.get("goals", 0)) + 1
+            return
+
+        if next_state is None or not self.grid.contains_state(next_state):
+            return
+
+        self._remember_discovered_state(state)
+        self._remember_discovered_state(next_state)
+        out_key = str(int(next_state))
+        outcomes = stats.setdefault("outcomes", {})
+        outcomes[out_key] = int(outcomes.get(out_key, 0)) + 1
+
+        if next_state == state:
+            stats["self_loops"] = int(stats.get("self_loops", 0)) + 1
+        elif intended is not None and int(next_state) == int(intended):
+            stats["forward"] = int(stats.get("forward", 0)) + 1
+        else:
+            stats["side_slips"] = int(stats.get("side_slips", 0)) + 1
+
+    def _transition_stats(self, state: int, action: str) -> Optional[Dict]:
+        return self.meta.get("transition_stats", {}).get(self._transition_key(state, action))
+
+    def _is_wall_like_transition(self, state: int, action: str) -> bool:
+        stats = self._transition_stats(state, action)
+        if not stats:
+            return False
+        tries = int(stats.get("tries", 0))
+        if tries < int(self.cfg.wall_min_trials):
+            return False
+        if int(stats.get("hazards", 0)) > 0:
+            return False
+        forward_rate = float(stats.get("forward", 0)) / max(1, tries)
+        self_loop_rate = float(stats.get("self_loops", 0)) / max(1, tries)
+        return forward_rate <= float(self.cfg.wall_forward_threshold) and self_loop_rate >= float(self.cfg.wall_self_loop_threshold)
+
+    def _queue_frontier_push(self, state: int, action_idx: int) -> int:
+        self.meta["frontier_push"] = {
+            "state": int(state),
+            "action": self.actions[action_idx],
+            "remaining": int(self.cfg.wall_push_retry_limit),
+        }
+        return action_idx
+
+    def _consume_frontier_push(self, state: int) -> Optional[int]:
+        push = self.meta.get("frontier_push")
+        if not isinstance(push, dict):
+            return None
+        try:
+            push_state = int(push.get("state"))
+            action = str(push.get("action"))
+            remaining = int(push.get("remaining", 0))
+        except Exception:
+            self.meta["frontier_push"] = None
+            return None
+        if push_state != int(state) or action not in ACTION_TO_IDX or remaining <= 0:
+            self.meta["frontier_push"] = None
+            return None
+        if self._transition_key(state, action) in set(self.meta.get("bad_transitions", [])):
+            self.meta["frontier_push"] = None
+            return None
+        push["remaining"] = remaining - 1
+        if push["remaining"] <= 0:
+            self.meta["frontier_push"] = None
+        return ACTION_TO_IDX[action]
 
     def _remember_safe_edge(self, state: int, action: str, next_state: Optional[int]) -> None:
         if next_state is None or not self.grid.contains_state(next_state):
@@ -901,8 +1000,10 @@ class QLearningAgent:
         bad = set(self.meta.get("bad_transitions", []))
         tried = set(self.meta.get("tried_transitions", []))
         safe_edges = self.meta.get("safe_edges", {})
+        discovered = set(self.meta.get("discovered_states", []))
 
         current_candidates = []
+        wall_push_candidates = []
         for idx, act in enumerate(self.actions):
             key = self._transition_key(state, act)
             neighbor = self.learner._neighbor_state(state, idx)
@@ -910,10 +1011,17 @@ class QLearningAgent:
                 continue
             if key not in tried:
                 current_candidates.append(idx)
+                continue
+            if self._is_wall_like_transition(state, act) and neighbor not in discovered:
+                wall_push_candidates.append(idx)
         if current_candidates:
             min_visits = min(self.action_visits[state, idx] for idx in current_candidates)
             best = [idx for idx in current_candidates if self.action_visits[state, idx] == min_visits]
             return int(random.choice(best))
+        if wall_push_candidates:
+            min_visits = min(self.action_visits[state, idx] for idx in wall_push_candidates)
+            best = [idx for idx in wall_push_candidates if self.action_visits[state, idx] == min_visits]
+            return self._queue_frontier_push(state, int(random.choice(best)))
 
         graph: Dict[int, List[Tuple[int, int]]] = {}
         for key, next_state in safe_edges.items():
@@ -941,6 +1049,8 @@ class QLearningAgent:
                     continue
                 if key not in tried:
                     return int(first_action if first_action is not None else idx)
+                if cur == state and self._is_wall_like_transition(cur, act) and neighbor not in discovered:
+                    return self._queue_frontier_push(cur, int(first_action if first_action is not None else idx))
             for nxt, a_idx in graph.get(cur, []):
                 if nxt not in seen:
                     seen.add(nxt)
@@ -951,12 +1061,16 @@ class QLearningAgent:
         if self.cfg.goal_optimization_mode:
             return self._choose_goal_biased_action(state, epsilon, prev_state)
 
-        if (not self.cfg.eval_mode and random.random() < self.cfg.frontier_search_prob):
+        push_idx = self._consume_frontier_push(state)
+        if push_idx is not None:
+            return self._avoid_bad_action(state, push_idx)
+
+        if random.random() < self.cfg.frontier_search_prob:
             frontier_idx = self._frontier_action(state)
             if frontier_idx is not None:
                 return self._avoid_bad_action(state, frontier_idx)
         action_idx = self.learner.choose_action(
-            self.q, state, epsilon, self.action_visits, None if self.cfg.eval_mode else self.state_visits,
+            self.q, state, epsilon, self.action_visits, self.state_visits,
         )
         return self._avoid_bad_action(state, action_idx)
 
@@ -972,9 +1086,31 @@ class QLearningAgent:
             "reward": float(reward),
             "step_found": int(step),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "discovered",
         }
         self.meta["goal_entry"] = goal_entry
+        self.save()
         print(f"Saved goal entry: from state {state}, take action {action}.")
+
+    def _normalize_goal_entry(self, goal_entry: Optional[Dict]) -> Optional[Dict[str, object]]:
+        if not isinstance(goal_entry, dict):
+            return None
+        try:
+            state = int(goal_entry["state"])
+            action = str(goal_entry["action"])
+        except Exception:
+            return None
+        if action not in ACTION_TO_IDX or not self.grid.contains_state(state):
+            return None
+        normalized = dict(goal_entry)
+        normalized["state"] = state
+        normalized["action"] = action
+        normalized.setdefault("source", "persisted")
+        return normalized
+
+    def _effective_goal_entry(self, persist_override: bool = True) -> Optional[Dict[str, object]]:
+        del persist_override
+        return self._normalize_goal_entry(self.meta.get("goal_entry"))
 
     def find_shortest_known_goal_path(self, start_state: int) -> Optional[List[str]]:
         """Find shortest known path to the saved goal entry using safe_edges.
@@ -982,7 +1118,7 @@ class QLearningAgent:
         Returns a list of actions. The last action is the terminal goal action.
         If safe_edges are incomplete, returns None and the caller should fall back to Q-learning.
         """
-        goal_entry = self.meta.get("goal_entry")
+        goal_entry = self._effective_goal_entry()
         if not goal_entry:
             return None
 
@@ -1032,8 +1168,6 @@ class QLearningAgent:
 
     def follow_planned_goal_path(self, episode_index: int, initial_state: int, path: List[str]) -> Dict:
         """Follow a BFS-planned path, while still updating Q-values and graph memory.
-
-        This is not blind replay: if an edge fails or becomes hazardous, it is recorded as bad.
         """
         state = initial_state
         total_reward = 0.0
@@ -1067,6 +1201,8 @@ class QLearningAgent:
                 if next_state is None:
                     next_state = state
 
+            self._record_transition_outcome(state, action, next_state, done, reward)
+            self._record_transition_outcome(state, action, next_state, done, reward)
             self._update_state_reward_avg(next_state, reward)
 
             if done and reward < 0:
@@ -1079,9 +1215,8 @@ class QLearningAgent:
                 self._remember_safe_edge(state, action, next_state)
                 policy_reward = reward
 
-            if not self.cfg.eval_mode:
-                td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
-                total_td_error += abs(td_error)
+            td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
+            total_td_error += abs(td_error)
 
             total_reward += reward
             total_policy_reward += policy_reward
@@ -1139,7 +1274,7 @@ class QLearningAgent:
         return summary
 
     def run_episode(self, episode_index: int, initial_state: int) -> Dict:
-        epsilon = 0.0 if self.cfg.eval_mode else float(self.meta.get("epsilon", self.cfg.epsilon))
+        epsilon = float(self.meta.get("epsilon", self.cfg.epsilon))
         state = initial_state
         total_reward = 0.0
         total_policy_reward = 0.0
@@ -1162,18 +1297,15 @@ class QLearningAgent:
 
             episode_state_counts[state] = episode_state_counts.get(state, 0) + 1
 
-            if not self.cfg.eval_mode:
-                self.state_visits[state] += 1.0
+            self.state_visits[state] += 1.0
             self._bump_total(f"state_{state}_visits")
             prev_state = visited_states[-2] if len(visited_states) > 1 else None
             action_idx = self._choose_exploration_action(state, epsilon, prev_state)
             action = self.actions[action_idx]
             action_counts[action] += 1
             self._bump_total(f"action_{action}_count")
-            if not self.cfg.eval_mode:
-                self.action_visits[state, action_idx] += 1.0
+            self.action_visits[state, action_idx] += 1.0
 
-            # self._respect_rate_limit("last_move_ts", self.cfg.move_delay_sec)
             move_data = self.client.move(self.cfg.world_id, action)
             self._mark_call("last_move_ts")
 
@@ -1201,6 +1333,7 @@ class QLearningAgent:
                     self._record_warning(warning)
                     print(f"Warning: {warning}")
 
+            self._record_transition_outcome(state, action, next_state, done, reward)
             self._update_state_reward_avg(next_state, reward)
             novelty_reward = self._state_novelty_reward(next_state, done)
             loop_penalty = 0.0
@@ -1235,9 +1368,8 @@ class QLearningAgent:
                     policy_reward = reward + novelty_reward + loop_penalty
 
             td_error = 0.0
-            if not self.cfg.eval_mode:
-                td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
-                total_td_error += abs(td_error)
+            td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
+            total_td_error += abs(td_error)
             total_reward += reward
             total_policy_reward += policy_reward
 
@@ -1250,7 +1382,6 @@ class QLearningAgent:
                     f"Action {action:>5s} | Reward {reward:8.3f} | "
                     f"PolicyReward {policy_reward:8.3f} | "
                     f"Next {str(next_state):>4s} | Done={done} | "
-                    f"Blocked={outcome.blocked} | Invalid={outcome.invalid_move} | "
                     f"AssumedTerminal={outcome.assumed_terminal}"
                 )
 
@@ -1268,10 +1399,9 @@ class QLearningAgent:
             done = True
             ended_by_step_limit = True
 
-        if not self.cfg.eval_mode:
-            epsilon = max(self.cfg.epsilon_min, epsilon * self.cfg.epsilon_decay)
-            self.meta["epsilon"] = epsilon
-            self.meta["episodes_completed"] = int(self.meta.get("episodes_completed", 0)) + 1
+        epsilon = max(self.cfg.epsilon_min, epsilon * self.cfg.epsilon_decay)
+        self.meta["epsilon"] = epsilon
+        self.meta["episodes_completed"] = int(self.meta.get("episodes_completed", 0)) + 1
 
         best = self.meta.get("best_episode_reward")
         if best is None or total_reward > best:
@@ -1304,7 +1434,6 @@ class QLearningAgent:
 
         self._update_running_metrics(episode_summary)
         return episode_summary
-
 
     def _state_to_row_col(self, state: int) -> Tuple[int, int]:
         return int(state) // self.grid.cols, int(state) % self.grid.cols
@@ -1408,7 +1537,7 @@ class QLearningAgent:
         This is faster than generic Q-learning when there are no walls, but hazards may still
         sit on the direct route, so BFS safe path remains preferred whenever available.
         """
-        goal_entry = self.meta.get("goal_entry")
+        goal_entry = self._effective_goal_entry()
         if not goal_entry:
             raise GridWorldAPIError("No known goal entry for coordinate exploit.")
 
@@ -1482,9 +1611,8 @@ class QLearningAgent:
                 self_loop_penalty = -1.0 if next_state == state else 0.0
                 policy_reward = reward + progress_bonus + self_loop_penalty
 
-            if not self.cfg.eval_mode:
-                td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
-                total_td_error += abs(td_error)
+            td_error = self.learner.update_q(self.q, state, action_idx, policy_reward, next_state, done)
+            total_td_error += abs(td_error)
 
             total_reward += reward
             total_policy_reward += policy_reward
@@ -1542,7 +1670,6 @@ class QLearningAgent:
         self._update_running_metrics(summary)
         return summary
 
-
     def train(self) -> None:
         current_state = self.enter_world_once()
         for episode in range(1, self.cfg.max_episodes + 1):
@@ -1570,7 +1697,6 @@ class QLearningAgent:
         self.save()
         print(f"Saved Q-table to {self.store.q_path}")
         print(f"Saved metadata to {self.store.meta_path}")
-
 
 class CampaignRunner:
     def __init__(self, config: QConfig):
@@ -1685,9 +1811,6 @@ class CampaignRunner:
                 if goal_was_already_found:
                     print(f"World {agent.cfg.world_id} goal already found. Starting goal-optimization run.")
 
-                    # Keep learning enabled. Full eval_mode would freeze Q-values,
-                    # so the agent would not improve the path after the first goal.
-                    agent.cfg.eval_mode = False
                     agent.cfg.goal_optimization_mode = True
 
                     # Almost greedy: mostly follows the best known path,
@@ -1695,8 +1818,6 @@ class CampaignRunner:
                     agent.meta["epsilon"] = 0.01
 
                     # Turn off exploration/novelty bonuses during optimization.
-                    # Important: update both cfg and learner, because QLearner stores
-                    # these values internally after construction.
                     agent.cfg.exploration_bonus = 0.0
                     agent.cfg.state_novelty_bonus = 0.0
                     agent.cfg.unvisited_state_bonus = 0.0
@@ -1728,7 +1849,7 @@ class CampaignRunner:
                             f"{len(planned_path)} action(s)."
                         )
                         summary = agent.follow_planned_goal_path(episode_index, start_state, planned_path)
-                    elif agent.meta.get("goal_entry"):
+                    elif agent._effective_goal_entry() is not None:
                         print(
                             "No complete safe-edge path to goal yet. Using coordinate-biased exploit "
                             "because this world has no walls. This will also record safe_edges for future BFS."
@@ -1801,7 +1922,6 @@ class CampaignRunner:
                 self._save_progress()
                 raise
 
-
 def parse_args() -> QConfig:
     parser = argparse.ArgumentParser(
         description="Q-learning agent for the NoteXponential grid world API"
@@ -1831,6 +1951,10 @@ def parse_args() -> QConfig:
     parser.add_argument("--unvisited-state-bonus", type=float, default=1.0)
     parser.add_argument("--frontier-bonus", type=float, default=0.2)
     parser.add_argument("--frontier-search-prob", type=float, default=0.85)
+    parser.add_argument("--wall-min-trials", type=int, default=2)
+    parser.add_argument("--wall-self-loop-threshold", type=float, default=0.20)
+    parser.add_argument("--wall-forward-threshold", type=float, default=0.2)
+    parser.add_argument("--wall-push-retry-limit", type=int, default=13)
     parser.add_argument("--loop-penalty-weight", type=float, default=0.1)
     parser.add_argument("--hazard-penalty-multiplier", type=float, default=3.0)
     parser.add_argument("--goal-short-path-bonus", type=float, default=300.0)
@@ -1844,13 +1968,8 @@ def parse_args() -> QConfig:
         help="Start the campaign from this world number. Equivalent to setting campaign-world-start.",
     )
     parser.add_argument("--campaign-world-start", type=int, default=2)
-    parser.add_argument("--campaign-world-end", type=int, default=2)
-    parser.add_argument("--traversals-per-world", type=int, default=3)
-    parser.add_argument(
-        "--eval-mode",
-        action="store_true",
-        help="Disable exploration and learning updates; run the current policy greedily for evaluation.",
-    )
+    parser.add_argument("--campaign-world-end", type=int, default=10)
+    parser.add_argument("--traversals-per-world", type=int, default=5)
     parser.add_argument(
         "--strict-missing-state",
         action="store_true",
@@ -1901,24 +2020,25 @@ def parse_args() -> QConfig:
         unvisited_state_bonus=args.unvisited_state_bonus,
         frontier_bonus=args.frontier_bonus,
         frontier_search_prob=args.frontier_search_prob,
+        wall_min_trials=args.wall_min_trials,
+        wall_self_loop_threshold=args.wall_self_loop_threshold,
+        wall_forward_threshold=args.wall_forward_threshold,
+        wall_push_retry_limit=args.wall_push_retry_limit,
         loop_penalty_weight=args.loop_penalty_weight,
         hazard_penalty_multiplier=args.hazard_penalty_multiplier,
         goal_short_path_bonus=args.goal_short_path_bonus,
         goal_q_bias_multiplier=args.goal_q_bias_multiplier,
         goal_reward_gradient_weight=args.goal_reward_gradient_weight,
         goal_backtrack_penalty=args.goal_backtrack_penalty,
-        eval_mode=args.eval_mode,
         campaign_world_start=campaign_world_start,
         campaign_world_end=args.campaign_world_end,
         traversals_per_world=args.traversals_per_world,
     )
 
-
 def main() -> None:
     cfg = parse_args()
     runner = CampaignRunner(cfg)
     runner.run()
-
 
 if __name__ == "__main__":
     main()
